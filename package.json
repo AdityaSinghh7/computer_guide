@@ -4,9 +4,18 @@
   "private": true,
   "description": "Mastra project scaffold for computer_guide",
   "scripts": {
-    "dev": "mastra dev",
-    "build": "mastra build",
-    "typecheck": "tsc --noEmit"
+    "dev": "./scripts/with-dotenv.sh mastra dev",
+    "build": "./scripts/with-dotenv.sh mastra build",
+    "typecheck": "tsc --noEmit",
+    "chat:agent": "./scripts/with-dotenv.sh node --import tsx src/scripts/chatMainAgent.ts",
+    "chat:agent:reset-memory": "./scripts/with-dotenv.sh node --import tsx src/scripts/resetMainAgentMemory.ts",
+    "desktop-server:build": "./scripts/with-dotenv.sh env PATH=\"$HOME/.swiftly/bin:$PATH\" \"$HOME/.swiftly/bin/swift\" build --package-path desktop-server",
+    "desktop-server:install-app": "./scripts/with-dotenv.sh ./scripts/install-desktop-server-app.sh",
+    "desktop-server:start": "./desktop-server/run-from-repo-root.sh",
+    "desktop-server:start:dev": "./desktop-server/run-dev-from-repo-root.sh",
+    "desktop-server:status": "./scripts/with-dotenv.sh ./scripts/desktop-server-status.sh",
+    "desktop-server:stop": "./scripts/with-dotenv.sh ./scripts/desktop-server-stop.sh",
+    "e2e:desktop-agent": "./scripts/with-dotenv.sh node --import tsx src/evals/desktopAgentE2E.ts"
   },
   "repository": {
     "type": "git",
@@ -32,6 +41,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.3.5",
+    "tsx": "^4.21.0",
     "typescript": "^5.9.3"
   }
 }

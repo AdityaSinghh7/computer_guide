@@ -6,3 +6,5 @@ dist/
 *.db
 *.db-shm
 *.db-wal
+.logs/
+desktop-server/.build/
