@@ -20,32 +20,14 @@ export const clickArgsSchema = z.object({
   element_description: z
     .string()
     .describe(
-      'Detailed description of the UI element to click. Mention visible text, iconography, relative location, window context, or nearby elements so the target can be identified unambiguously.',
+      'Detailed description of the UI element to click. Mention visible text, iconography, relative location, window context, or nearby elements so the grounding model can identify the target visually.',
     ),
   app: z
     .string()
     .trim()
     .min(1)
     .optional()
-    .describe('Optional application name or bundle identifier to target before resolving the element, such as "Google Chrome" or "com.google.Chrome".'),
-  window_title: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional window title substring to constrain element resolution to a specific window in the target app.'),
-  snapshot_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional snapshot ID returned by see. Prefer providing this together with element_id after a fresh see call to avoid fuzzy matching.'),
-  element_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional exact element ID returned by see, such as elem_37. Use with snapshot_id for stable clicks.'),
+    .describe('Optional application name or bundle identifier to target before grounding the element, such as "Google Chrome" or "com.google.Chrome".'),
   num_clicks: z
     .number()
     .int()
@@ -67,7 +49,7 @@ export const clickResultSchema = guiActionResultSchema;
 export const clickTool = createTool({
   id: 'click',
   description:
-    'Click a specific UI element on screen. Use this for buttons, links, controls, tabs, menus, or other clickable targets. Prefer supplying snapshot_id plus element_id from a fresh see call for stable clicks. If those are unavailable, provide app and window_title along with a precise element description.',
+    'Click a specific UI element on screen using vision-based grounding. Use this for buttons, links, controls, tabs, menus, or other clickable targets. Provide the app when known and make the element description visually specific.',
   inputSchema: clickArgsSchema,
   outputSchema: clickResultSchema,
   execute: input => callDesktopAction('/v1/click', input, clickResultSchema, { toolId: 'click' }),
@@ -142,35 +124,15 @@ export const openTool = createTool({
 export const typeArgsSchema = z.object({
   element_description: z
     .string()
-    .nullable()
-    .default(null)
     .describe(
-      'Detailed description of the target input area to focus before typing. Include field label, placeholder, nearby text, or window context. Use null only when text should be entered into the currently focused field.',
+      'Detailed description of the target input area to focus before typing. Include field label, placeholder, nearby text, or window context so the grounding model can find it visually.',
     ),
   app: z
     .string()
     .trim()
     .min(1)
     .optional()
-    .describe('Optional application name or bundle identifier to target before resolving the field, such as "Google Chrome" or "com.google.Chrome".'),
-  window_title: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional window title substring to constrain field resolution to a specific window.'),
-  snapshot_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional snapshot ID returned by see. Prefer using this with element_id after a fresh capture.'),
-  element_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional exact element ID returned by see. Use with snapshot_id for stable typing targets.'),
+    .describe('Optional application name or bundle identifier to target before grounding the field, such as "Google Chrome" or "com.google.Chrome".'),
   text: z
     .string()
     .default('')
@@ -190,7 +152,7 @@ export const typeResultSchema = guiActionResultSchema;
 export const typeTool = createTool({
   id: 'type',
   description:
-    'Type or paste text into a target field or the currently focused input. Use this for forms, search boxes, editors, chat inputs, and any other text entry task. Prefer supplying snapshot_id plus element_id from a fresh see call for stable typing targets.',
+    'Type or paste text into a visually described field using vision-based grounding. Use this for forms, search boxes, editors, chat inputs, and other text entry tasks.',
   inputSchema: typeArgsSchema,
   outputSchema: typeResultSchema,
   execute: input => callDesktopAction('/v1/type', input, typeResultSchema, { toolId: 'type' }),
@@ -214,31 +176,7 @@ export const dragAndDropArgsSchema = z.object({
     .trim()
     .min(1)
     .optional()
-    .describe('Optional application name or bundle identifier to target before resolving the drag source and destination.'),
-  window_title: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional window title substring to constrain drag target resolution to a specific window.'),
-  snapshot_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional snapshot ID returned by see. Prefer using this with starting_element_id and ending_element_id after a fresh capture.'),
-  starting_element_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional exact source element ID returned by see. Use with snapshot_id for stable drag start targeting.'),
-  ending_element_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional exact destination element ID returned by see. Use with snapshot_id for stable drag end targeting.'),
+    .describe('Optional application name or bundle identifier to target before grounding the drag source and destination.'),
   hold_keys: z
     .array(z.string())
     .default([])
@@ -250,7 +188,7 @@ export const dragAndDropResultSchema = guiActionResultSchema;
 export const dragAndDropTool = createTool({
   id: 'drag_and_drop',
   description:
-    'Drag from one described UI location to another and then release. Use this for moving files, reordering items, resizing panes, or any interaction that requires a click-drag gesture. Prefer supplying snapshot_id with starting_element_id and ending_element_id from a fresh see call for stable drag targets.',
+    'Drag from one visually described UI location to another and then release using vision-based grounding. Use this for moving files, reordering items, resizing panes, or any interaction that requires a click-drag gesture.',
   inputSchema: dragAndDropArgsSchema,
   outputSchema: dragAndDropResultSchema,
   execute: input =>
@@ -269,25 +207,7 @@ export const scrollArgsSchema = z.object({
     .trim()
     .min(1)
     .optional()
-    .describe('Optional application name or bundle identifier to target before resolving the scroll region.'),
-  window_title: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional window title substring to constrain scroll target resolution to a specific window.'),
-  snapshot_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional snapshot ID returned by see. Prefer using this with element_id after a fresh capture.'),
-  element_id: z
-    .string()
-    .trim()
-    .min(1)
-    .optional()
-    .describe('Optional exact element ID returned by see. Use with snapshot_id for stable scrolling targets.'),
+    .describe('Optional application name or bundle identifier to target before grounding the scroll region.'),
   clicks: z
     .number()
     .int()
@@ -305,7 +225,7 @@ export const scrollResultSchema = guiActionResultSchema;
 export const scrollTool = createTool({
   id: 'scroll',
   description:
-    'Scroll within a specific UI region or element. Use this to reveal off-screen content, move through lists or documents, or perform horizontal scrolling when supported. Prefer supplying snapshot_id plus element_id from a fresh see call for stable targeting.',
+    'Scroll within a visually described UI region or element using vision-based grounding. Use this to reveal off-screen content, move through lists or documents, or perform horizontal scrolling when supported.',
   inputSchema: scrollArgsSchema,
   outputSchema: scrollResultSchema,
   execute: input => callDesktopAction('/v1/scroll', input, scrollResultSchema, { toolId: 'scroll' }),
@@ -416,7 +336,7 @@ export const seeResultSchema = desktopSeeSuccessSchema;
 export const seeTool = createTool({
   id: 'see',
   description:
-    'Capture the current macOS UI state and return a screenshot plus detected UI elements. Use this to inspect what is on screen, discover actionable element IDs, or debug why a click/type target is ambiguous. When the user asks about a specific app, prefer targeting that app or switching to it first instead of describing whatever app is currently frontmost. The returned snapshot_id and ui_elements ids should be reused immediately for grounded follow-up actions.',
+    'Capture the current macOS UI state and return a screenshot plus detected UI elements. Use this to inspect what is on screen or debug why a vision-grounded action failed. When the user asks about a specific app, prefer targeting that app or switching to it first instead of describing whatever app is currently frontmost.',
   inputSchema: seeArgsSchema,
   outputSchema: seeResultSchema,
   execute: input => callDesktopAction('/v1/see', input, seeResultSchema, { toolId: 'see' }),
@@ -456,7 +376,7 @@ export const screenshotResultSchema = desktopSeeSuccessSchema;
 export const screenshotTool = createTool({
   id: 'screenshot',
   description:
-    'Capture a screenshot of the current desktop or a targeted app/window. Use this when you need a saved image of the UI, or when you want a screenshot plus the same element metadata returned by see. When the user asks about a specific app, prefer targeting that app or switching to it first before capturing. The returned snapshot_id and ui_elements ids can be used for grounded follow-up actions.',
+    'Capture a screenshot of the current desktop or a targeted app/window. Use this when you need a saved image of the UI, or when you want a screenshot plus the same element metadata returned by see. When the user asks about a specific app, prefer targeting that app or switching to it first before capturing.',
   inputSchema: screenshotArgsSchema,
   outputSchema: screenshotResultSchema,
   execute: input =>

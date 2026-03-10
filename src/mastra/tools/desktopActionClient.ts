@@ -57,11 +57,73 @@ export const resolvedTargetSchema = z
   .nullable()
   .optional();
 
+export const desktopActionArtifactSchema = z
+  .object({
+    before: z
+      .object({
+        screenshot_path: z.string(),
+        application: z.string().nullable().optional(),
+        window: z.string().nullable().optional(),
+        capture_bounds: z
+          .object({
+            x: z.number(),
+            y: z.number(),
+            width: z.number(),
+            height: z.number(),
+          })
+          .nullable()
+          .optional(),
+      })
+      .nullable()
+      .optional(),
+    after: z
+      .object({
+        screenshot_path: z.string(),
+        application: z.string().nullable().optional(),
+        window: z.string().nullable().optional(),
+        capture_bounds: z
+          .object({
+            x: z.number(),
+            y: z.number(),
+            width: z.number(),
+            height: z.number(),
+          })
+          .nullable()
+          .optional(),
+      })
+      .nullable()
+      .optional(),
+    groundings: z.array(
+      z.object({
+        description: z.string(),
+        screenshot_x: z.number(),
+        screenshot_y: z.number(),
+        screen_x: z.number(),
+        screen_y: z.number(),
+        screenshot_path: z.string().nullable().optional(),
+        application: z.string().nullable().optional(),
+        window: z.string().nullable().optional(),
+        capture_bounds: z
+          .object({
+            x: z.number(),
+            y: z.number(),
+            width: z.number(),
+            height: z.number(),
+          })
+          .nullable()
+          .optional(),
+      }),
+    ),
+  })
+  .nullable()
+  .optional();
+
 export const desktopActionSuccessSchema = z.object({
   action_id: z.string(),
   ok: z.literal(true),
   message: z.string(),
   resolved_target: resolvedTargetSchema,
+  artifact: desktopActionArtifactSchema,
   duration_ms: z.number().nonnegative(),
 });
 
@@ -334,7 +396,7 @@ const accessibilityProtectedPaths = new Set([
   '/v1/hold-and-press',
 ]);
 
-const screenRecordingProtectedPaths = new Set(['/v1/see']);
+const screenRecordingProtectedPaths = new Set(['/v1/click', '/v1/type', '/v1/drag', '/v1/scroll', '/v1/see']);
 
 export const preflightDesktopPermissions = async (options?: {
   requestAccessibilityIfMissing?: boolean;

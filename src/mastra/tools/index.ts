@@ -1,2 +1,3 @@
+export * from './computerUseTools';
 export * from './guiActionTools';
-export { mainAgentTools } from './registry';
+export { computerUseActionTools, mainAgentTools } from './registry';

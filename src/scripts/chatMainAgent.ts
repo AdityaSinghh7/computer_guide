@@ -5,7 +5,10 @@ import { parseArgs } from 'node:util';
 
 import { readEnv } from '../mastra/env';
 import { mastra } from '../mastra';
+import type { ComputerUseWorkflowOutput } from '../mastra/computer-use/schemas';
+import { mainAgentMemory } from '../mastra/memory/main-agent-memory';
 import { preflightDesktopPermissions } from '../mastra/tools/desktopActionClient';
+import { resumeComputerUseTool } from '../mastra/tools/computerUseTools';
 
 const { values, positionals } = parseArgs({
   options: {
@@ -20,6 +23,14 @@ type ChatMemory = {
   thread: string;
   resource: string;
 };
+
+type SuspendedRunContext = {
+  runId: string;
+  suspendedPath?: string[];
+  question: string;
+};
+
+const suspendedRunMetadataKey = 'computerGuideSuspendedRun';
 
 const defaultInteractiveResource = 'local-user';
 const defaultThreadFromEnv = readEnv('MAIN_AGENT_DEFAULT_THREAD');
@@ -102,22 +113,179 @@ const runDesktopPreflight = async () => {
     output.write('Typing, clicking, scrolling, dragging, and hotkeys will not work until Accessibility is granted.\n');
   }
   if (!permissions.screen_recording) {
-    output.write('The see/screenshot tools will not work until Screen Recording is granted.\n');
+    output.write('See, screenshot, clicking, typing, scrolling, and dragging will not work until Screen Recording is granted.\n');
   }
+};
+
+const isComputerUseWorkflowOutput = (value: unknown): value is ComputerUseWorkflowOutput =>
+  typeof value === 'object' &&
+  value !== null &&
+  'status' in value &&
+  'finalResponse' in value &&
+  'workflowRunId' in value;
+
+const readToolResultEntry = (value: unknown) => {
+  if (typeof value !== 'object' || value === null) {
+    return null;
+  }
+
+  const record = value as {
+    toolName?: unknown;
+    result?: unknown;
+    payload?: {
+      toolName?: unknown;
+      result?: unknown;
+    };
+  };
+
+  const toolName =
+    typeof record.toolName === 'string'
+      ? record.toolName
+      : typeof record.payload?.toolName === 'string'
+        ? record.payload.toolName
+        : undefined;
+  const result = 'result' in record ? record.result : record.payload?.result;
+
+  return {
+    toolName,
+    result,
+  };
+};
+
+const extractLatestComputerUseResult = (result: { toolResults?: unknown[] }) => {
+  const toolResults = result.toolResults ?? [];
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    const toolResult = readToolResultEntry(toolResults[index]);
+    if (!toolResult) {
+      continue;
+    }
+
+    if (
+      (toolResult.toolName === 'run_computer_use' ||
+        toolResult.toolName === 'resume_computer_use') &&
+      isComputerUseWorkflowOutput(toolResult.result)
+    ) {
+      return toolResult.result;
+    }
+  }
+
+  return undefined;
+};
+
+const formatSuspendedQuestion = (output: ComputerUseWorkflowOutput) =>
+  output.handoff?.question ??
+  output.handoff?.userAction ??
+  output.finalResponse;
+
+const inferResumeAction = (prompt: string): 'continue' | 'abort' => {
+  const normalized = prompt.trim().toLowerCase();
+  if (
+    normalized === 'stop' ||
+    normalized === 'cancel' ||
+    normalized === 'abort' ||
+    normalized === 'never mind' ||
+    normalized === 'nevermind' ||
+    normalized === 'quit' ||
+    normalized === 'don\'t continue'
+  ) {
+    return 'abort';
+  }
+
+  return 'continue';
+};
+
+const readPersistedSuspendedRun = async (
+  memory: ChatMemory,
+): Promise<SuspendedRunContext | null> => {
+  const thread = await mainAgentMemory.getThreadById({ threadId: memory.thread });
+  if (!thread) {
+    return null;
+  }
+
+  const record = thread.metadata?.[suspendedRunMetadataKey];
+  if (!record || typeof record !== 'object') {
+    return null;
+  }
+
+  const runId = 'runId' in record && typeof record.runId === 'string' ? record.runId : null;
+  const question =
+    'question' in record && typeof record.question === 'string' ? record.question : null;
+  const suspendedPath =
+    'suspendedPath' in record && Array.isArray(record.suspendedPath)
+      ? record.suspendedPath.filter((value): value is string => typeof value === 'string')
+      : undefined;
+
+  if (!runId || !question) {
+    return null;
+  }
+
+  return {
+    runId,
+    suspendedPath,
+    question,
+  };
+};
+
+const persistSuspendedRun = async (
+  memory: ChatMemory,
+  suspendedRun: SuspendedRunContext | null,
+) => {
+  let thread = await mainAgentMemory.getThreadById({ threadId: memory.thread });
+
+  if (!thread) {
+    thread = await mainAgentMemory.createThread({
+      threadId: memory.thread,
+      resourceId: memory.resource,
+      title: 'Terminal Chat',
+    });
+  }
+
+  const metadata = { ...(thread.metadata ?? {}) };
+
+  if (suspendedRun) {
+    metadata[suspendedRunMetadataKey] = suspendedRun;
+  } else {
+    delete metadata[suspendedRunMetadataKey];
+  }
+
+  await mainAgentMemory.updateThread({
+    id: thread.id,
+    title: thread.title ?? 'Terminal Chat',
+    metadata,
+  });
 };
 
 const generateReply = async (prompt: string, memory: ChatMemory | undefined, maxSteps: number) => {
   const agent = mastra.getAgent('mainAgent');
-  const result = await agent.generate(prompt, {
+  const stream = await agent.stream(prompt, {
     maxSteps,
     ...(memory ? { memory } : {}),
   });
+  const result = await stream.getFullOutput();
 
   if (result.error) {
     throw result.error;
   }
 
-  return result.text;
+  const workflowResult = extractLatestComputerUseResult(result);
+  const suspendedRun =
+    workflowResult?.status === 'suspended' && workflowResult.workflowRunId
+      ? {
+          runId: workflowResult.workflowRunId,
+          suspendedPath: workflowResult.suspendedPath,
+          question: formatSuspendedQuestion(workflowResult),
+        }
+      : null;
+
+  const text =
+    workflowResult?.status === 'suspended'
+      ? `I need one thing before I can continue: ${formatSuspendedQuestion(workflowResult)}`
+      : result.text;
+
+  return {
+    text,
+    suspendedRun,
+  };
 };
 
 const runOneShot = async (prompt: string, maxSteps: number) => {
@@ -132,17 +300,21 @@ const runOneShot = async (prompt: string, maxSteps: number) => {
     output.write(`thread=${memory.thread} resource=${memory.resource}\n`);
   }
 
-  output.write(`${reply}\n`);
+  output.write(`${reply.text}\n`);
 };
 
 const runInteractive = async (maxSteps: number) => {
   const memory = createInteractiveMemory();
   const rl = createInterface({ input, output });
+  let suspendedRun = await readPersistedSuspendedRun(memory);
 
   output.write('Interactive chat started. Type "exit" to quit.\n');
   output.write(`thread=${memory.thread} resource=${memory.resource}\n`);
   output.write('Conversation history is stored in mastra.db. Desktop action logs are stored in .logs/*.jsonl.\n');
   await runDesktopPreflight();
+  if (suspendedRun) {
+    output.write(`agent> I need one thing before I can continue: ${suspendedRun.question}\n`);
+  }
 
   try {
     while (true) {
@@ -154,8 +326,41 @@ const runInteractive = async (maxSteps: number) => {
         break;
       }
 
+      if (suspendedRun) {
+        const resumed = await resumeComputerUseTool.execute?.(
+          {
+            runId: suspendedRun.runId,
+            ...(suspendedRun.suspendedPath ? { suspendedPath: suspendedRun.suspendedPath } : {}),
+            userResponse: prompt,
+            action: inferResumeAction(prompt),
+          },
+          {},
+        );
+
+        const workflowResult = resumed as ComputerUseWorkflowOutput;
+        if (workflowResult.status === 'suspended' && workflowResult.workflowRunId) {
+          suspendedRun = {
+            runId: workflowResult.workflowRunId,
+            suspendedPath: workflowResult.suspendedPath,
+            question: formatSuspendedQuestion(workflowResult),
+          };
+          await persistSuspendedRun(memory, suspendedRun);
+          output.write(
+            `agent> I still need one thing before I can continue: ${formatSuspendedQuestion(workflowResult)}\n`,
+          );
+          continue;
+        }
+
+        suspendedRun = null;
+        await persistSuspendedRun(memory, null);
+        output.write(`agent> ${workflowResult.finalResponse}\n`);
+        continue;
+      }
+
       const reply = await generateReply(prompt, memory, maxSteps);
-      output.write(`agent> ${reply}\n`);
+      suspendedRun = reply.suspendedRun;
+      await persistSuspendedRun(memory, suspendedRun);
+      output.write(`agent> ${reply.text}\n`);
     }
   } finally {
     rl.close();

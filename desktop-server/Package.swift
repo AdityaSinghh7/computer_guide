@@ -23,5 +23,8 @@ let package = Package(
                 .product(name: "PeekabooBridge", package: "Peekaboo"),
                 .product(name: "PeekabooFoundation", package: "Peekaboo"),
             ]),
+        .testTarget(
+            name: "ComputerGuideDesktopServerTests",
+            dependencies: ["ComputerGuideDesktopServer"]),
     ],
     swiftLanguageModes: [.v6])

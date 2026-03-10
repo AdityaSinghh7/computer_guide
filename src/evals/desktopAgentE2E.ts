@@ -30,7 +30,7 @@ Execute these exact steps in order:
 1. Use the open tool to open TextEdit.
 2. Use the wait tool for 1 second.
 3. Use the hotkey tool with keys ["cmd","n"] to create a new document if TextEdit is open without a focused editor.
-4. Use the type tool with element_description set to null to type exactly: Peekaboo desktop E2E is working
+4. Use the type tool targeting the main empty TextEdit editor area to type exactly: Peekaboo desktop E2E is working
 5. Finish with the exact text E2E_OK
 Do not claim success unless the tools actually succeed.`;
 

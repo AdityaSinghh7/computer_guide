@@ -13,7 +13,8 @@ Mastra project scaffold initialized in this repository.
 
 1. Copy `.env.example` to `.env`
 2. Add your `OPENROUTER_API_KEY`
-3. Run `npm run dev`
+3. Set `COMPUTER_GUIDE_GROUNDING_MODEL` to the OpenRouter model used for UI grounding
+4. Run `npm run dev`
 
 The main agent now defaults to `openrouter/openai/gpt-5.1`. Override it with `MAIN_AGENT_MODEL` if you want a different OpenRouter model.
 
@@ -24,6 +25,7 @@ The GUI Mastra tools now call a local macOS desktop action server in `desktop-se
 Required environment variables:
 
 - `COMPUTER_GUIDE_DESKTOP_TOKEN`: bearer token shared by Mastra and the desktop server
+- `COMPUTER_GUIDE_GROUNDING_MODEL`: OpenRouter model used by the desktop server to ground UI targets before click/type/drag/scroll actions
 - `COMPUTER_GUIDE_DESKTOP_HOST`: optional, defaults to `127.0.0.1`
 - `COMPUTER_GUIDE_DESKTOP_PORT`: optional, defaults to `47613`
 

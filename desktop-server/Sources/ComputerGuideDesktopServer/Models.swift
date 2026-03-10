@@ -20,6 +20,7 @@ struct SuccessResponse: Codable, Sendable {
     let ok: Bool
     let message: String
     let resolved_target: ResolvedTargetPayload?
+    let artifact: ActionArtifactPayload?
     let duration_ms: Int
 }
 
@@ -46,6 +47,31 @@ struct ResolvedTargetPayload: Codable, Sendable {
     let application: String?
     let window: String?
     let bounds: BoundsPayload?
+}
+
+struct ActionCapturePayload: Codable, Sendable {
+    let screenshot_path: String
+    let application: String?
+    let window: String?
+    let capture_bounds: BoundsPayload?
+}
+
+struct ActionGroundingPayload: Codable, Sendable {
+    let description: String
+    let screenshot_x: Double
+    let screenshot_y: Double
+    let screen_x: Double
+    let screen_y: Double
+    let screenshot_path: String?
+    let application: String?
+    let window: String?
+    let capture_bounds: BoundsPayload?
+}
+
+struct ActionArtifactPayload: Codable, Sendable {
+    let before: ActionCapturePayload?
+    let after: ActionCapturePayload?
+    let groundings: [ActionGroundingPayload]
 }
 
 struct PermissionStatusPayload: Codable, Sendable {
@@ -77,9 +103,6 @@ struct HealthPayload: Codable, Sendable {
 struct ClickRequest: Codable, Sendable {
     let element_description: String
     let app: String?
-    let window_title: String?
-    let snapshot_id: String?
-    let element_id: String?
     let num_clicks: Int?
     let button_type: String?
     let hold_keys: [String]?
@@ -96,33 +119,46 @@ struct OpenRequest: Codable, Sendable {
 }
 
 struct TypeRequest: Codable, Sendable {
-    let element_description: String?
+    let element_description: String
     let app: String?
-    let window_title: String?
-    let snapshot_id: String?
-    let element_id: String?
     let text: String
-    let overwrite: Bool?
-    let enter: Bool?
+    let overwrite: Bool
+    let enter: Bool
+
+    init(
+        element_description: String,
+        app: String? = nil,
+        text: String = "",
+        overwrite: Bool = false,
+        enter: Bool = false)
+    {
+        self.element_description = element_description
+        self.app = app
+        self.text = text
+        self.overwrite = overwrite
+        self.enter = enter
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.element_description = try container.decode(String.self, forKey: .element_description)
+        self.app = try container.decodeIfPresent(String.self, forKey: .app)
+        self.text = try container.decodeIfPresent(String.self, forKey: .text) ?? ""
+        self.overwrite = try container.decodeIfPresent(Bool.self, forKey: .overwrite) ?? false
+        self.enter = try container.decodeIfPresent(Bool.self, forKey: .enter) ?? false
+    }
 }
 
 struct DragRequest: Codable, Sendable {
     let starting_description: String
     let ending_description: String
     let app: String?
-    let window_title: String?
-    let snapshot_id: String?
-    let starting_element_id: String?
-    let ending_element_id: String?
     let hold_keys: [String]?
 }
 
 struct ScrollRequestPayload: Codable, Sendable {
     let element_description: String
     let app: String?
-    let window_title: String?
-    let snapshot_id: String?
-    let element_id: String?
     let clicks: Int
     let shift: Bool?
 }

@@ -10,16 +10,14 @@ final class DesktopActionServer {
     private let port: Int
     private let token: String
     private let observability: LocalObservability
+    private let loggingService = LoggingService()
     private let permissionsService = PermissionsService()
     private let applicationService = ApplicationService()
     private let snapshotManager = SnapshotManager()
     private lazy var automationService = UIAutomationService(snapshotManager: snapshotManager)
-    private lazy var visionService = DesktopVisionService(snapshotManager: snapshotManager)
-    private lazy var detectionService = ElementDetectionService(applicationService: applicationService)
-    private lazy var targetResolver = TargetResolver(
-        applicationService: applicationService,
-        detectionService: detectionService,
-        snapshotManager: snapshotManager)
+    private lazy var visionService = DesktopVisionService(snapshotManager: snapshotManager, loggingService: loggingService)
+    private var cachedGroundingService: GroundingService?
+    private var cachedGroundedActionPipeline: GroundedActionPipeline?
     private let customInput = CustomInputPerformer()
 
     init(host: String, port: Int, token: String, observability: LocalObservability) {
@@ -99,7 +97,7 @@ final class DesktopActionServer {
                 return try HTTPResponse.json(payload)
             case (.POST, "/v1/click"):
                 let payload: ClickRequest = try self.decode(request.body)
-                let result = try await self.handleClick(payload, actionID: actionID, startedAt: startedAt)
+                let result = try await self.handleClick(payload, httpRequest: request, actionID: actionID, startedAt: startedAt)
                 await self.recordSuccess(
                     request: request,
                     actionID: actionID,
@@ -129,7 +127,7 @@ final class DesktopActionServer {
                 return try HTTPResponse.json(result)
             case (.POST, "/v1/type"):
                 let payload: TypeRequest = try self.decode(request.body)
-                let result = try await self.handleType(payload, actionID: actionID, startedAt: startedAt)
+                let result = try await self.handleType(payload, httpRequest: request, actionID: actionID, startedAt: startedAt)
                 await self.recordSuccess(
                     request: request,
                     actionID: actionID,
@@ -139,7 +137,7 @@ final class DesktopActionServer {
                 return try HTTPResponse.json(result)
             case (.POST, "/v1/drag"):
                 let payload: DragRequest = try self.decode(request.body)
-                let result = try await self.handleDrag(payload, actionID: actionID, startedAt: startedAt)
+                let result = try await self.handleDrag(payload, httpRequest: request, actionID: actionID, startedAt: startedAt)
                 await self.recordSuccess(
                     request: request,
                     actionID: actionID,
@@ -149,7 +147,7 @@ final class DesktopActionServer {
                 return try HTTPResponse.json(result)
             case (.POST, "/v1/scroll"):
                 let payload: ScrollRequestPayload = try self.decode(request.body)
-                let result = try await self.handleScroll(payload, actionID: actionID, startedAt: startedAt)
+                let result = try await self.handleScroll(payload, httpRequest: request, actionID: actionID, startedAt: startedAt)
                 await self.recordSuccess(
                     request: request,
                     actionID: actionID,
@@ -282,6 +280,28 @@ final class DesktopActionServer {
         }
     }
 
+    private func requireGroundingPermissions() throws {
+        try self.requireAccessibility()
+        if !self.permissionsService.checkScreenRecordingPermission() {
+            _ = self.permissionsService.requestScreenRecordingPermission(interactive: true)
+        }
+        guard permissionsService.checkScreenRecordingPermission() else {
+            throw DesktopServerError.permissionDenied("Screen Recording permission is required")
+        }
+    }
+
+    private func groundingClient() throws -> GroundingService {
+        if let cachedGroundingService = self.cachedGroundingService {
+            return cachedGroundingService
+        }
+        let groundingService = try GroundingService(
+            screenCaptureService: ScreenCaptureService(loggingService: loggingService),
+            permissionsService: permissionsService,
+            observability: observability)
+        self.cachedGroundingService = groundingService
+        return groundingService
+    }
+
     private func decode<T: Decodable>(_ body: Data) throws -> T {
         do {
             return try JSONDecoder().decode(T.self, from: body)
@@ -290,8 +310,22 @@ final class DesktopActionServer {
         }
     }
 
-    private func handleClick(_ request: ClickRequest, actionID: String, startedAt: Date) async throws -> SuccessResponse {
-        try self.requireAccessibility()
+    private func groundedActionPipeline() throws -> GroundedActionPipeline {
+        if let cachedGroundedActionPipeline = self.cachedGroundedActionPipeline {
+            return cachedGroundedActionPipeline
+        }
+        let pipeline = GroundedActionPipeline(groundingService: try self.groundingClient())
+        self.cachedGroundedActionPipeline = pipeline
+        return pipeline
+    }
+
+    private func handleClick(
+        _ request: ClickRequest,
+        httpRequest: HTTPRequest,
+        actionID: String,
+        startedAt: Date) async throws -> SuccessResponse
+    {
+        try self.requireGroundingPermissions()
         try await self.activateRequestedApplication(request.app)
 
         let clickCount = max(1, request.num_clicks ?? 1)
@@ -299,32 +333,22 @@ final class DesktopActionServer {
             throw DesktopServerError.invalidInput("Unsupported button_type '\(request.button_type ?? "")'")
         }
         let modifiers = request.hold_keys ?? []
-        let resolved = try await self.targetResolver.resolve(
+        let artifact = try await self.groundedActionPipeline().executeSingle(
             description: request.element_description,
-            intent: .click,
-            context: TargetContext(
-                app: request.app,
-                windowTitle: request.window_title,
-                snapshotID: request.snapshot_id,
-                elementID: request.element_id))
-        let point = CGPoint(x: resolved.bounds.midX, y: resolved.bounds.midY)
-        let snapshotID = request.snapshot_id?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let elementID = request.element_id?.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        if modifiers.isEmpty, button != .middle, clickCount <= 2, let snapshotID, let elementID, !snapshotID.isEmpty, !elementID.isEmpty {
-            let clickType: ClickType = clickCount == 2 ? .double : (button == .right ? .right : .single)
-            try await self.automationService.click(target: .elementId(elementID), clickType: clickType, snapshotId: snapshotID)
-        } else if modifiers.isEmpty, button != .middle, clickCount <= 2 {
-            let clickType: ClickType = clickCount == 2 ? .double : (button == .right ? .right : .single)
-            try await self.automationService.click(target: .coordinates(point), clickType: clickType, snapshotId: nil)
-        } else {
-            try self.customInput.performPointerClick(at: point, button: button, clickCount: clickCount, modifiers: modifiers)
-        }
+            app: request.app,
+            observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { grounded in
+                try self.customInput.performPointerClick(
+                    at: grounded.screenPoint,
+                    button: button,
+                    clickCount: clickCount,
+                    modifiers: modifiers)
+            }
 
         return self.success(
             actionID: actionID,
-            message: "Clicked \(resolved.label ?? resolved.elementID)",
-            target: resolved,
+            message: "Clicked \(request.element_description)",
+            target: artifact.targets.first.map { self.makeGroundedResolvedElement(from: $0.point) },
+            artifact: self.makeActionArtifactPayload(from: artifact),
             startedAt: startedAt)
     }
 
@@ -391,150 +415,122 @@ final class DesktopActionServer {
         return self.success(actionID: actionID, message: "Launched \(app.name)", target: nil, startedAt: startedAt)
     }
 
-    private func handleType(_ request: TypeRequest, actionID: String, startedAt: Date) async throws -> SuccessResponse {
-        try self.requireAccessibility()
+    private func handleType(
+        _ request: TypeRequest,
+        httpRequest: HTTPRequest,
+        actionID: String,
+        startedAt: Date) async throws -> SuccessResponse
+    {
+        try self.requireGroundingPermissions()
         try await self.activateRequestedApplication(request.app)
 
-        var resolvedTarget: ResolvedElement?
-        let hasDescription = !(request.element_description?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
-        let hasGroundedElement = (request.snapshot_id?.isEmpty == false) && (request.element_id?.isEmpty == false)
+        let artifact = try await self.groundedActionPipeline().executeSingle(
+            description: request.element_description,
+            app: request.app,
+            observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { grounded in
+                try self.customInput.performPointerClick(at: grounded.screenPoint, button: .left, clickCount: 1, modifiers: [])
+                try await Task.sleep(nanoseconds: 100_000_000)
 
-        if hasDescription || hasGroundedElement {
-            let resolved = try await self.targetResolver.resolve(
-                description: request.element_description ?? "",
-                intent: .type,
-                context: TargetContext(
-                    app: request.app,
-                    windowTitle: request.window_title,
-                    snapshotID: request.snapshot_id,
-                    elementID: request.element_id))
-            resolvedTarget = resolved
-            let snapshotID = request.snapshot_id?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let elementID = request.element_id?.trimmingCharacters(in: .whitespacesAndNewlines)
-            if let snapshotID, let elementID, !snapshotID.isEmpty, !elementID.isEmpty {
-                try await self.automationService.type(
-                    text: request.text,
-                    target: elementID,
-                    clearExisting: request.overwrite ?? false,
-                    typingDelay: 50,
-                    snapshotId: snapshotID)
-
-                if request.enter ?? false {
-                    try self.customInput.performHeldKeySequence(holdKeys: [], pressKeys: ["return"])
+                if request.overwrite {
+                    try await self.automationService.hotkey(keys: "cmd,a", holdDuration: 0)
+                    try self.customInput.performHeldKeySequence(holdKeys: [], pressKeys: ["delete"])
                 }
 
-                return self.success(
-                    actionID: actionID,
-                    message: "Typed \(request.text.count) characters",
-                    target: resolvedTarget,
-                    startedAt: startedAt)
+                try await self.automationService.type(
+                    text: request.text,
+                    target: nil,
+                    clearExisting: false,
+                    typingDelay: 50,
+                    snapshotId: nil)
+
+                if request.enter {
+                    try self.customInput.performHeldKeySequence(holdKeys: [], pressKeys: ["return"])
+                }
             }
-
-            let point = CGPoint(x: resolved.bounds.midX, y: resolved.bounds.midY)
-            try await self.automationService.click(target: .coordinates(point), clickType: .single, snapshotId: nil)
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-
-        if request.overwrite ?? false {
-            try await self.automationService.hotkey(keys: "cmd,a", holdDuration: 0)
-            try self.customInput.performHeldKeySequence(holdKeys: [], pressKeys: ["delete"])
-        }
-
-        try await self.automationService.type(
-            text: request.text,
-            target: nil,
-            clearExisting: false,
-            typingDelay: 50,
-            snapshotId: nil)
-
-        if request.enter ?? false {
-            try self.customInput.performHeldKeySequence(holdKeys: [], pressKeys: ["return"])
-        }
 
         return self.success(
             actionID: actionID,
             message: "Typed \(request.text.count) characters",
-            target: resolvedTarget,
+            target: artifact.targets.first.map { self.makeGroundedResolvedElement(from: $0.point) },
+            artifact: self.makeActionArtifactPayload(from: artifact),
             startedAt: startedAt)
     }
 
-    private func handleDrag(_ request: DragRequest, actionID: String, startedAt: Date) async throws -> SuccessResponse {
-        try self.requireAccessibility()
+    private func handleDrag(
+        _ request: DragRequest,
+        httpRequest: HTTPRequest,
+        actionID: String,
+        startedAt: Date) async throws -> SuccessResponse
+    {
+        try self.requireGroundingPermissions()
         try await self.activateRequestedApplication(request.app)
 
-        let start = try await self.targetResolver.resolve(
-            description: request.starting_description,
-            intent: .drag,
-            context: TargetContext(
-                app: request.app,
-                windowTitle: request.window_title,
-                snapshotID: request.snapshot_id,
-                elementID: request.starting_element_id))
-        let end = try await self.targetResolver.resolve(
-            description: request.ending_description,
-            intent: .drag,
-            context: TargetContext(
-                app: request.app,
-                windowTitle: request.window_title,
-                snapshotID: request.snapshot_id,
-                elementID: request.ending_element_id))
-
-        try await self.automationService.drag(
-            from: CGPoint(x: start.bounds.midX, y: start.bounds.midY),
-            to: CGPoint(x: end.bounds.midX, y: end.bounds.midY),
-            duration: 500,
-            steps: 24,
-            modifiers: self.modifierString(from: request.hold_keys ?? []),
-            profile: .linear)
+        let artifact = try await self.groundedActionPipeline().executeDual(
+            firstDescription: request.starting_description,
+            secondDescription: request.ending_description,
+            app: request.app,
+            observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { start, end in
+                try await self.automationService.drag(
+                    from: start.screenPoint,
+                    to: end.screenPoint,
+                    duration: 500,
+                    steps: 24,
+                    modifiers: self.modifierString(from: request.hold_keys ?? []),
+                    profile: .linear)
+            }
 
         return self.success(
             actionID: actionID,
-            message: "Dragged from \(start.label ?? start.elementID) to \(end.label ?? end.elementID)",
-            target: end,
+            message: "Dragged from \(request.starting_description) to \(request.ending_description)",
+            target: artifact.targets.last.map { self.makeGroundedResolvedElement(from: $0.point) },
+            artifact: self.makeActionArtifactPayload(from: artifact),
             startedAt: startedAt)
     }
 
-    private func handleScroll(_ request: ScrollRequestPayload, actionID: String, startedAt: Date) async throws -> SuccessResponse {
-        try self.requireAccessibility()
+    private func handleScroll(
+        _ request: ScrollRequestPayload,
+        httpRequest: HTTPRequest,
+        actionID: String,
+        startedAt: Date) async throws -> SuccessResponse
+    {
+        try self.requireGroundingPermissions()
         try await self.activateRequestedApplication(request.app)
         guard request.clicks != 0 else {
             throw DesktopServerError.invalidInput("clicks must not be 0")
         }
 
-        let resolved = try await self.targetResolver.resolve(
+        let artifact = try await self.groundedActionPipeline().executeSingle(
             description: request.element_description,
-            intent: .scroll,
-            context: TargetContext(
-                app: request.app,
-                windowTitle: request.window_title,
-                snapshotID: request.snapshot_id,
-                elementID: request.element_id))
-        try await self.automationService.moveMouse(
-            to: CGPoint(x: resolved.bounds.midX, y: resolved.bounds.midY),
-            duration: 0,
-            steps: 1,
-            profile: .linear)
+            app: request.app,
+            observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { grounded in
+                try await self.automationService.moveMouse(
+                    to: grounded.screenPoint,
+                    duration: 0,
+                    steps: 1,
+                    profile: .linear)
 
-        let direction: PeekabooFoundation.ScrollDirection
-        if request.shift ?? false {
-            direction = request.clicks > 0 ? .right : .left
-        } else {
-            direction = request.clicks > 0 ? .up : .down
-        }
+                let direction: PeekabooFoundation.ScrollDirection
+                if request.shift ?? false {
+                    direction = request.clicks > 0 ? .right : .left
+                } else {
+                    direction = request.clicks > 0 ? .up : .down
+                }
 
-        let scrollRequest = PeekabooAutomationKit.ScrollRequest(
-            direction: direction,
-            amount: abs(request.clicks),
-            target: nil,
-            smooth: false,
-            delay: 10,
-            snapshotId: nil)
-        try await self.automationService.scroll(scrollRequest)
+                let scrollRequest = PeekabooAutomationKit.ScrollRequest(
+                    direction: direction,
+                    amount: abs(request.clicks),
+                    target: nil,
+                    smooth: false,
+                    delay: 10,
+                    snapshotId: nil)
+                try await self.automationService.scroll(scrollRequest)
+            }
 
         return self.success(
             actionID: actionID,
             message: "Scrolled \(request.element_description)",
-            target: resolved,
+            target: artifact.targets.first.map { self.makeGroundedResolvedElement(from: $0.point) },
+            artifact: self.makeActionArtifactPayload(from: artifact),
             startedAt: startedAt)
     }
 
@@ -619,6 +615,7 @@ final class DesktopActionServer {
         actionID: String,
         message: String,
         target: ResolvedElement?,
+        artifact: ActionArtifactPayload? = nil,
         startedAt: Date) -> SuccessResponse
     {
         SuccessResponse(
@@ -632,7 +629,38 @@ final class DesktopActionServer {
                     window: $0.windowTitle,
                     bounds: BoundsPayload(rect: $0.bounds))
             },
+            artifact: artifact,
             duration_ms: Int(Date().timeIntervalSince(startedAt) * 1000))
+    }
+
+    private func makeActionArtifactPayload(from artifact: GroundedActionExecutionArtifact) -> ActionArtifactPayload {
+        ActionArtifactPayload(
+            before: artifact.before.map {
+                ActionCapturePayload(
+                    screenshot_path: $0.screenshotPath,
+                    application: $0.applicationName,
+                    window: $0.windowTitle,
+                    capture_bounds: BoundsPayload(rect: $0.captureBounds))
+            },
+            after: artifact.after.map {
+                ActionCapturePayload(
+                    screenshot_path: $0.screenshotPath,
+                    application: $0.applicationName,
+                    window: $0.windowTitle,
+                    capture_bounds: BoundsPayload(rect: $0.captureBounds))
+            },
+            groundings: artifact.targets.map {
+                ActionGroundingPayload(
+                    description: $0.point.description,
+                    screenshot_x: $0.point.screenshotPoint.x,
+                    screenshot_y: $0.point.screenshotPoint.y,
+                    screen_x: $0.point.screenPoint.x,
+                    screen_y: $0.point.screenPoint.y,
+                    screenshot_path: $0.point.screenshotPath,
+                    application: $0.point.applicationName,
+                    window: $0.point.windowTitle,
+                    capture_bounds: BoundsPayload(rect: $0.point.captureBounds))
+            })
     }
 
     private func errorResponse(_ error: DesktopServerError) -> HTTPResponse {
@@ -650,6 +678,29 @@ final class DesktopActionServer {
         return value.isEmpty ? nil : value
     }
 
+    private func groundingObservabilityContext(
+        for request: HTTPRequest,
+        actionID: String) -> GroundingObservabilityContext
+    {
+        GroundingObservabilityContext(
+            runID: request.observabilityRunID,
+            actionID: actionID,
+            method: request.method.rawValue,
+            path: request.path)
+    }
+
+    private func makeGroundedResolvedElement(from grounded: GroundedPoint) -> ResolvedElement {
+        let point = grounded.screenPoint
+        let bounds = CGRect(x: point.x - 1, y: point.y - 1, width: 2, height: 2)
+        return ResolvedElement(
+            appName: grounded.applicationName,
+            windowTitle: grounded.windowTitle,
+            elementID: "grounded:\(Int(point.x)):\(Int(point.y))",
+            elementType: "vision_grounded",
+            label: grounded.description,
+            bounds: bounds)
+    }
+
     private func recordSuccess(
         request: HTTPRequest,
         actionID: String,
@@ -664,6 +715,7 @@ final class DesktopActionServer {
             responseStatus: responseStatus,
             message: result.message,
             target: result.resolved_target,
+            artifact: result.artifact,
             response: [
                 "ok": result.ok,
                 "action_id": result.action_id,
@@ -678,6 +730,7 @@ final class DesktopActionServer {
         responseStatus: Int,
         message: String,
         target: ResolvedTargetPayload?,
+        artifact: ActionArtifactPayload? = nil,
         response: [String: Any]) async
     {
         var event = self.baseEvent(request: request, actionID: actionID, startedAt: startedAt)
@@ -687,6 +740,9 @@ final class DesktopActionServer {
         event["response"] = response
         if let target {
             event["resolved_target"] = self.dictionary(from: target)
+        }
+        if let artifact {
+            event["artifact"] = self.dictionary(from: artifact)
         }
         await self.record(event: event)
     }
@@ -753,6 +809,68 @@ final class DesktopActionServer {
             ]
         }
 
+        return result
+    }
+
+    private func dictionary(from artifact: ActionArtifactPayload) -> [String: Any] {
+        var result: [String: Any] = [
+            "groundings": artifact.groundings.map(self.dictionary(from:)),
+        ]
+        if let before = artifact.before {
+            result["before"] = self.dictionary(from: before)
+        }
+        if let after = artifact.after {
+            result["after"] = self.dictionary(from: after)
+        }
+        return result
+    }
+
+    private func dictionary(from capture: ActionCapturePayload) -> [String: Any] {
+        var result: [String: Any] = [
+            "screenshot_path": capture.screenshot_path,
+        ]
+        if let application = capture.application {
+            result["application"] = application
+        }
+        if let window = capture.window {
+            result["window"] = window
+        }
+        if let captureBounds = capture.capture_bounds {
+            result["capture_bounds"] = [
+                "x": captureBounds.x,
+                "y": captureBounds.y,
+                "width": captureBounds.width,
+                "height": captureBounds.height,
+            ]
+        }
+        return result
+    }
+
+    private func dictionary(from grounding: ActionGroundingPayload) -> [String: Any] {
+        var result: [String: Any] = [
+            "description": grounding.description,
+            "screenshot_x": grounding.screenshot_x,
+            "screenshot_y": grounding.screenshot_y,
+            "screen_x": grounding.screen_x,
+            "screen_y": grounding.screen_y,
+        ]
+        if let screenshotPath = grounding.screenshot_path {
+            result["screenshot_path"] = screenshotPath
+        }
+        if let application = grounding.application {
+            result["application"] = application
+        }
+        if let window = grounding.window {
+            result["window"] = window
+        }
+        if let captureBounds = grounding.capture_bounds {
+            result["capture_bounds"] = [
+                "x": captureBounds.x,
+                "y": captureBounds.y,
+                "width": captureBounds.width,
+                "height": captureBounds.height,
+            ]
+        }
         return result
     }
 
