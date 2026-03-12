@@ -30,7 +30,24 @@ type SuspendedRunContext = {
   question: string;
 };
 
+type RunTimelineEventPayload = Record<string, unknown>;
+
+type RunTimelineEventInput = {
+  runId: string;
+  event: {
+    type: string;
+    timestamp: string;
+    payload: RunTimelineEventPayload;
+  };
+};
+
+type RunTimelineModule = {
+  appendRunTimelineEvent?: (input: RunTimelineEventInput) => Promise<void> | void;
+  recordRunTimelineEvent?: (input: RunTimelineEventInput) => Promise<void> | void;
+};
+
 const suspendedRunMetadataKey = 'computerGuideSuspendedRun';
+const runTimelineModulePath = '../mastra/observability/runTimeline';
 
 const defaultInteractiveResource = 'local-user';
 const defaultThreadFromEnv = readEnv('MAIN_AGENT_DEFAULT_THREAD');
@@ -42,6 +59,47 @@ const readStdinPrompt = async () => {
     data += chunk;
   }
   return data.trim();
+};
+
+const loadRunTimelineModule = async (): Promise<RunTimelineModule | null> => {
+  try {
+    return (await import(runTimelineModulePath)) as RunTimelineModule;
+  } catch {
+    return null;
+  }
+};
+
+const appendRunTimelineEvent = async (
+  runId: string,
+  type: string,
+  payload: RunTimelineEventPayload,
+) => {
+  if (!runId.trim()) {
+    return;
+  }
+
+  try {
+    const module = await loadRunTimelineModule();
+    const input: RunTimelineEventInput = {
+      runId,
+      event: {
+        type,
+        timestamp: new Date().toISOString(),
+        payload,
+      },
+    };
+
+    if (module?.appendRunTimelineEvent) {
+      await module.appendRunTimelineEvent(input);
+      return;
+    }
+
+    if (module?.recordRunTimelineEvent) {
+      await module.recordRunTimelineEvent(input);
+    }
+  } catch {
+    // Observability must stay best-effort so chat execution is never blocked by logging.
+  }
 };
 
 const createInteractiveMemory = (): ChatMemory => ({
@@ -172,10 +230,48 @@ const extractLatestComputerUseResult = (result: { toolResults?: unknown[] }) => 
   return undefined;
 };
 
+const normalizeSuspendedText = (value: string | null | undefined) => {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+};
+
+const isGenericSuspendedQuestion = (value: string | undefined) =>
+  !!value && /^what should i do next\?/i.test(value.trim());
+
+const isGenericSuspendedUserAction = (value: string | undefined) =>
+  !!value &&
+  /tell the assistant what changed|provide the missing information needed to continue/i.test(
+    value.trim(),
+  );
+
+const pickSuspendedExplanation = (output: ComputerUseWorkflowOutput) => {
+  const question = normalizeSuspendedText(output.handoff?.question);
+  const userAction = normalizeSuspendedText(output.handoff?.userAction);
+  const summary = normalizeSuspendedText(output.handoff?.summary);
+  const reason = normalizeSuspendedText(output.handoff?.reason);
+  const finalResponse = normalizeSuspendedText(output.finalResponse);
+
+  const candidates = [
+    !isGenericSuspendedQuestion(question) ? question : undefined,
+    !isGenericSuspendedUserAction(userAction) ? userAction : undefined,
+    summary,
+    reason,
+    finalResponse,
+    question,
+    userAction,
+  ];
+
+  for (const candidate of candidates) {
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  return 'The workflow is waiting for more input before it can continue.';
+};
+
 const formatSuspendedQuestion = (output: ComputerUseWorkflowOutput) =>
-  output.handoff?.question ??
-  output.handoff?.userAction ??
-  output.finalResponse;
+  pickSuspendedExplanation(output);
 
 const inferResumeAction = (prompt: string): 'continue' | 'abort' => {
   const normalized = prompt.trim().toLowerCase();
@@ -257,11 +353,20 @@ const persistSuspendedRun = async (
 
 const generateReply = async (prompt: string, memory: ChatMemory | undefined, maxSteps: number) => {
   const agent = mastra.getAgent('mainAgent');
-  const stream = await agent.stream(prompt, {
+  const result = await agent.generate(prompt, {
     maxSteps,
+    activeTools: ['run_computer_use'],
+    prepareStep: async ({ stepNumber }) => {
+      if (stepNumber > 0) {
+        return {
+          toolChoice: 'none',
+        };
+      }
+
+      return undefined;
+    },
     ...(memory ? { memory } : {}),
   });
-  const result = await stream.getFullOutput();
 
   if (result.error) {
     throw result.error;
@@ -285,6 +390,8 @@ const generateReply = async (prompt: string, memory: ChatMemory | undefined, max
   return {
     text,
     suspendedRun,
+    workflowResult,
+    rawModelText: result.text,
   };
 };
 
@@ -295,6 +402,23 @@ const runOneShot = async (prompt: string, maxSteps: number) => {
 
   const memory = createOneShotMemory();
   const reply = await generateReply(prompt, memory, maxSteps);
+  const runId = reply.workflowResult?.workflowRunId;
+
+  if (runId) {
+    await appendRunTimelineEvent(runId, 'human-input', {
+      source: 'one-shot',
+      text: prompt,
+      threadId: memory?.thread ?? null,
+      resourceId: memory?.resource ?? null,
+    });
+    await appendRunTimelineEvent(runId, 'assistant-output', {
+      source: 'one-shot',
+      text: reply.text,
+      rawModelText: reply.rawModelText,
+      workflowStatus: reply.workflowResult?.status ?? null,
+      suspendedPath: reply.workflowResult?.suspendedPath ?? null,
+    });
+  }
 
   if (memory) {
     output.write(`thread=${memory.thread} resource=${memory.resource}\n`);
@@ -327,15 +451,58 @@ const runInteractive = async (maxSteps: number) => {
       }
 
       if (suspendedRun) {
-        const resumed = await resumeComputerUseTool.execute?.(
-          {
-            runId: suspendedRun.runId,
-            ...(suspendedRun.suspendedPath ? { suspendedPath: suspendedRun.suspendedPath } : {}),
-            userResponse: prompt,
-            action: inferResumeAction(prompt),
-          },
-          {},
-        );
+        await appendRunTimelineEvent(suspendedRun.runId, 'human-input', {
+          source: 'resume',
+          text: prompt,
+          threadId: memory.thread,
+          resourceId: memory.resource,
+          suspendedPath: suspendedRun.suspendedPath ?? null,
+        });
+
+        let resumed: unknown;
+        try {
+          resumed = await resumeComputerUseTool.execute?.(
+            {
+              runId: suspendedRun.runId,
+              ...(suspendedRun.suspendedPath ? { suspendedPath: suspendedRun.suspendedPath } : {}),
+              userResponse: prompt,
+              action: inferResumeAction(prompt),
+            },
+            {},
+          );
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (/not suspended/i.test(message)) {
+            suspendedRun = null;
+            await persistSuspendedRun(memory, null);
+          } else {
+            throw error;
+          }
+        }
+
+        if (!resumed) {
+          const reply = await generateReply(prompt, memory, maxSteps);
+          const runId = reply.workflowResult?.workflowRunId;
+          if (runId) {
+            await appendRunTimelineEvent(runId, 'human-input', {
+              source: 'interactive',
+              text: prompt,
+              threadId: memory.thread,
+              resourceId: memory.resource,
+            });
+            await appendRunTimelineEvent(runId, 'assistant-output', {
+              source: 'interactive',
+              text: reply.text,
+              rawModelText: reply.rawModelText,
+              workflowStatus: reply.workflowResult?.status ?? null,
+              suspendedPath: reply.workflowResult?.suspendedPath ?? null,
+            });
+          }
+          suspendedRun = reply.suspendedRun;
+          await persistSuspendedRun(memory, suspendedRun);
+          output.write(`agent> ${reply.text}\n`);
+          continue;
+        }
 
         const workflowResult = resumed as ComputerUseWorkflowOutput;
         if (workflowResult.status === 'suspended' && workflowResult.workflowRunId) {
@@ -345,6 +512,13 @@ const runInteractive = async (maxSteps: number) => {
             question: formatSuspendedQuestion(workflowResult),
           };
           await persistSuspendedRun(memory, suspendedRun);
+          await appendRunTimelineEvent(workflowResult.workflowRunId, 'assistant-output', {
+            source: 'resume',
+            text: formatSuspendedQuestion(workflowResult),
+            rawModelText: workflowResult.finalResponse,
+            workflowStatus: workflowResult.status,
+            suspendedPath: workflowResult.suspendedPath ?? null,
+          });
           output.write(
             `agent> I still need one thing before I can continue: ${formatSuspendedQuestion(workflowResult)}\n`,
           );
@@ -353,11 +527,36 @@ const runInteractive = async (maxSteps: number) => {
 
         suspendedRun = null;
         await persistSuspendedRun(memory, null);
+        if (workflowResult.workflowRunId) {
+          await appendRunTimelineEvent(workflowResult.workflowRunId, 'assistant-output', {
+            source: 'resume',
+            text: workflowResult.finalResponse,
+            rawModelText: workflowResult.finalResponse,
+            workflowStatus: workflowResult.status,
+            suspendedPath: workflowResult.suspendedPath ?? null,
+          });
+        }
         output.write(`agent> ${workflowResult.finalResponse}\n`);
         continue;
       }
 
       const reply = await generateReply(prompt, memory, maxSteps);
+      const runId = reply.workflowResult?.workflowRunId;
+      if (runId) {
+        await appendRunTimelineEvent(runId, 'human-input', {
+          source: 'interactive',
+          text: prompt,
+          threadId: memory.thread,
+          resourceId: memory.resource,
+        });
+        await appendRunTimelineEvent(runId, 'assistant-output', {
+          source: 'interactive',
+          text: reply.text,
+          rawModelText: reply.rawModelText,
+          workflowStatus: reply.workflowResult?.status ?? null,
+          suspendedPath: reply.workflowResult?.suspendedPath ?? null,
+        });
+      }
       suspendedRun = reply.suspendedRun;
       await persistSuspendedRun(memory, suspendedRun);
       output.write(`agent> ${reply.text}\n`);

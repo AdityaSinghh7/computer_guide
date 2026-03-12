@@ -62,4 +62,77 @@ final class GroundingServiceTests: XCTestCase {
         XCTAssertEqual(point.x, 864, accuracy: 0.001)
         XCTAssertEqual(point.y, 24, accuracy: 0.001)
     }
+
+    func testDisplayCatalogBestMatchUsesLargestIntersectionArea() {
+        let displays = [
+            DisplayCatalogEntry(id: 11, index: 0, bounds: CGRect(x: 0, y: 0, width: 1728, height: 1117)),
+            DisplayCatalogEntry(id: 22, index: 1, bounds: CGRect(x: 1728, y: 0, width: 2560, height: 1440)),
+        ]
+
+        let match = DisplayCatalog.bestMatch(
+            for: CGRect(x: 2000, y: 120, width: 800, height: 600),
+            within: displays)
+
+        XCTAssertEqual(match?.id, 22)
+        XCTAssertEqual(match?.index, 1)
+    }
+
+    func testDisplayCatalogPrefersDisplayIDOverBounds() {
+        let displays = [
+            DisplayCatalogEntry(id: 11, index: 0, bounds: CGRect(x: 0, y: 0, width: 1728, height: 1117)),
+            DisplayCatalogEntry(id: 22, index: 1, bounds: CGRect(x: 1728, y: 0, width: 2560, height: 1440)),
+        ]
+
+        let match = DisplayCatalog.entry(
+            displayID: 11,
+            bounds: CGRect(x: 2200, y: 120, width: 800, height: 600),
+            within: displays)
+
+        XCTAssertEqual(match?.id, 11)
+        XCTAssertEqual(match?.index, 0)
+    }
+
+    func testObservedDisplayRecapturePrefersThreadedCaptureServiceIndex() {
+        let observationCapture = ObservationCapturePayload(
+            screenshot_path: "/tmp/observed-screen.png",
+            capture_mode: "screen",
+            display_id: 22,
+            display_index: 7,
+            capture_bounds: BoundsPayload(rect: CGRect(x: 1728, y: 0, width: 2560, height: 1440)),
+            image_size: SizePayload(size: CGSize(width: 5120, height: 2880)),
+            application: "Google Chrome",
+            window: "Amazon")
+        let validatedDisplay = DisplayCatalogEntry(
+            id: 22,
+            index: 1,
+            bounds: CGRect(x: 1728, y: 0, width: 2560, height: 1440))
+
+        let preferredIndex = GroundingService.preferredObservedDisplayIndex(
+            observationCapture: observationCapture,
+            validatedDisplay: validatedDisplay)
+
+        XCTAssertEqual(preferredIndex, 7)
+    }
+
+    func testObservedDisplayRecaptureFallsBackToValidatedDisplayIndex() {
+        let observationCapture = ObservationCapturePayload(
+            screenshot_path: "/tmp/observed-screen.png",
+            capture_mode: "screen",
+            display_id: 22,
+            display_index: nil,
+            capture_bounds: BoundsPayload(rect: CGRect(x: 1728, y: 0, width: 2560, height: 1440)),
+            image_size: SizePayload(size: CGSize(width: 5120, height: 2880)),
+            application: "Google Chrome",
+            window: "Amazon")
+        let validatedDisplay = DisplayCatalogEntry(
+            id: 22,
+            index: 1,
+            bounds: CGRect(x: 1728, y: 0, width: 2560, height: 1440))
+
+        let preferredIndex = GroundingService.preferredObservedDisplayIndex(
+            observationCapture: observationCapture,
+            validatedDisplay: validatedDisplay)
+
+        XCTAssertEqual(preferredIndex, 1)
+    }
 }

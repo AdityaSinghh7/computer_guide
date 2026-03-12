@@ -244,6 +244,7 @@ final class GroundingService {
     func ground(
         elementDescription: String,
         app: String?,
+        observationCapture: ObservationCapturePayload? = nil,
         observabilityContext: GroundingObservabilityContext? = nil) async throws -> GroundedPoint
     {
         let startedAt = Date()
@@ -264,24 +265,24 @@ final class GroundingService {
         var modelResult: GroundingModelResult?
 
         do {
-            let captureResult = try await self.capture(target: Self.captureTarget(for: app))
+            let captureResult = try await self.captureForGrounding(
+                app: app,
+                observationCapture: observationCapture)
             captureBounds = captureResult.captureBounds
-            imageSize = Self.imagePixelSize(
-                from: captureResult.result.imageData,
-                fallback: captureResult.result.metadata.size)
+            imageSize = captureResult.imageSize
             applicationName = captureResult.applicationName
             windowTitle = captureResult.windowTitle
             screenshotPath = try self.saveGroundingScreenshot(
-                imageData: captureResult.result.imageData,
+                imageData: captureResult.imageData,
                 observabilityContext: observabilityContext)
             modelResult = try await self.modelClient.groundCoordinate(
-                imageData: captureResult.result.imageData,
-                imageSize: imageSize ?? captureResult.result.metadata.size,
+                imageData: captureResult.imageData,
+                imageSize: imageSize ?? captureResult.imageSize,
                 elementDescription: normalizedDescription)
             let screenshotPoint = modelResult?.point ?? .zero
             let screenPoint = Self.mapScreenshotPointToScreen(
                 screenshotPoint,
-                imageSize: imageSize ?? captureResult.result.metadata.size,
+                imageSize: imageSize ?? captureResult.imageSize,
                 captureBounds: captureResult.captureBounds)
             let groundedPoint = GroundedPoint(
                 description: normalizedDescription,
@@ -297,7 +298,7 @@ final class GroundingService {
                 elementDescription: normalizedDescription,
                 app: app,
                 groundedPoint: groundedPoint,
-                imageSize: imageSize ?? captureResult.result.metadata.size,
+                imageSize: imageSize ?? captureResult.imageSize,
                 screenshotPath: screenshotPath,
                 modelResult: modelResult!)
             return groundedPoint
@@ -369,15 +370,18 @@ final class GroundingService {
 
     func captureArtifact(
         app: String?,
+        observationCapture: ObservationCapturePayload? = nil,
         observabilityContext: GroundingObservabilityContext? = nil) async throws -> GroundingCaptureArtifact
     {
         guard self.permissionsService.checkScreenRecordingPermission() else {
             throw DesktopServerError.permissionDenied("Screen Recording permission is required")
         }
 
-        let captureResult = try await self.capture(target: Self.captureTarget(for: app))
+        let captureResult = try await self.captureArtifactPayload(
+            app: app,
+            observationCapture: observationCapture)
         let screenshotPath = try self.saveGroundingScreenshot(
-            imageData: captureResult.result.imageData,
+            imageData: captureResult.imageData,
             observabilityContext: observabilityContext)
         return GroundingCaptureArtifact(
             screenshotPath: screenshotPath,
@@ -387,8 +391,11 @@ final class GroundingService {
     }
 
     private struct CapturePayload {
-        let result: CaptureResult
+        let imageData: Data
+        let imageSize: CGSize
         let captureBounds: CGRect
+        let displayID: CGDirectDisplayID?
+        let displayIndex: Int?
         let applicationName: String?
         let windowTitle: String?
     }
@@ -534,6 +541,88 @@ final class GroundingService {
         await observability.record(serializedEvent: data)
     }
 
+    private func captureForGrounding(
+        app: String?,
+        observationCapture: ObservationCapturePayload?) async throws -> CapturePayload
+    {
+        if let observationCapture {
+            return try self.captureObservedScreenshot(observationCapture)
+        }
+        return try await self.capture(target: Self.captureTarget(for: app))
+    }
+
+    private func captureArtifactPayload(
+        app: String?,
+        observationCapture: ObservationCapturePayload?) async throws -> CapturePayload
+    {
+        if let observationCapture {
+            return try await self.captureObservedDisplay(observationCapture)
+        }
+        return try await self.capture(target: Self.captureTarget(for: app))
+    }
+
+    private func captureObservedScreenshot(_ observationCapture: ObservationCapturePayload) throws -> CapturePayload {
+        if let captureMode = observationCapture.capture_mode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           captureMode != "screen"
+        {
+            throw DesktopServerError.invalidInput("observation_capture.capture_mode must be 'screen'")
+        }
+
+        let screenshotPath = NSString(string: observationCapture.screenshot_path).expandingTildeInPath
+        let imageData = try Data(contentsOf: URL(fileURLWithPath: screenshotPath))
+        let captureBounds = observationCapture.capture_bounds.rect
+        guard captureBounds.width > 0, captureBounds.height > 0 else {
+            throw DesktopServerError.invalidInput("observation_capture.capture_bounds must be valid")
+        }
+
+        let imageSize = observationCapture.image_size.size
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            throw DesktopServerError.invalidInput("observation_capture.image_size must be valid")
+        }
+
+        return CapturePayload(
+            imageData: imageData,
+            imageSize: imageSize,
+            captureBounds: captureBounds,
+            displayID: observationCapture.display_id,
+            displayIndex: observationCapture.display_index,
+            applicationName: observationCapture.application,
+            windowTitle: observationCapture.window)
+    }
+
+    private func captureObservedDisplay(_ observationCapture: ObservationCapturePayload) async throws -> CapturePayload {
+        if let captureMode = observationCapture.capture_mode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           captureMode != "screen"
+        {
+            throw DesktopServerError.invalidInput("observation_capture.capture_mode must be 'screen'")
+        }
+
+        let validatedDisplay = try self.displayEntry(for: observationCapture)
+        let captureIndex = Self.preferredObservedDisplayIndex(
+            observationCapture: observationCapture,
+            validatedDisplay: validatedDisplay)
+        guard let captureIndex else {
+            throw DesktopServerError.invalidInput("observation_capture did not resolve to an active display")
+        }
+        let result = try await self.screenCaptureService.captureScreen(displayIndex: captureIndex)
+        let imageSize = Self.imagePixelSize(from: result.imageData, fallback: result.metadata.size)
+        let captureBounds = result.metadata.displayInfo?.bounds
+            ?? validatedDisplay?.bounds
+            ?? observationCapture.capture_bounds.rect
+        guard captureBounds.width > 0, captureBounds.height > 0 else {
+            throw DesktopServerError.serverUnavailable("Grounding capture did not include valid bounds")
+        }
+
+        return CapturePayload(
+            imageData: result.imageData,
+            imageSize: imageSize,
+            captureBounds: captureBounds,
+            displayID: validatedDisplay?.id ?? observationCapture.display_id,
+            displayIndex: result.metadata.displayInfo?.index ?? captureIndex,
+            applicationName: result.metadata.applicationInfo?.name ?? observationCapture.application,
+            windowTitle: result.metadata.windowInfo?.title ?? observationCapture.window)
+    }
+
     private func capture(target: CaptureTarget) async throws -> CapturePayload {
         let seedCapture: CaptureResult
         switch target {
@@ -543,43 +632,42 @@ final class GroundingService {
             seedCapture = try await self.screenCaptureService.captureWindow(appIdentifier: app, windowIndex: nil)
         }
 
+        let display = try self.displayEntry(for: seedCapture)
         let result = try await self.screenCaptureService.captureScreen(
-            displayIndex: self.displayIndex(for: seedCapture))
+            displayIndex: display?.index ?? seedCapture.metadata.displayInfo?.index)
         let captureBounds = result.metadata.windowInfo?.bounds ?? result.metadata.displayInfo?.bounds ?? .zero
         guard captureBounds.width > 0, captureBounds.height > 0 else {
             throw DesktopServerError.serverUnavailable("Grounding capture did not include valid bounds")
         }
 
         return CapturePayload(
-            result: result,
+            imageData: result.imageData,
+            imageSize: Self.imagePixelSize(from: result.imageData, fallback: result.metadata.size),
             captureBounds: captureBounds,
+            displayID: display?.id,
+            displayIndex: display?.index ?? seedCapture.metadata.displayInfo?.index,
             applicationName: seedCapture.metadata.applicationInfo?.name,
             windowTitle: seedCapture.metadata.windowInfo?.title)
     }
 
-    private func displayIndex(for captureResult: CaptureResult) -> Int? {
+    private func displayEntry(for captureResult: CaptureResult) throws -> DisplayCatalogEntry? {
         let targetBounds = captureResult.metadata.windowInfo?.bounds ?? captureResult.metadata.displayInfo?.bounds
-
-        if let targetBounds,
-           let matchedScreen = NSScreen.screens.enumerated().max(by: { lhs, rhs in
-               self.intersectionArea(of: lhs.element.frame, with: targetBounds)
-                   < self.intersectionArea(of: rhs.element.frame, with: targetBounds)
-           }),
-           self.intersectionArea(of: matchedScreen.element.frame, with: targetBounds) > 0
-        {
-            return matchedScreen.offset
-        }
-
-        return captureResult.metadata.displayInfo?.index
+        return try DisplayCatalog.entry(
+            displayID: nil,
+            bounds: targetBounds)
     }
 
-    private func intersectionArea(of lhs: CGRect, with rhs: CGRect) -> CGFloat {
-        let intersection = lhs.intersection(rhs)
-        guard !intersection.isNull, !intersection.isEmpty else {
-            return 0
-        }
+    private func displayEntry(for observationCapture: ObservationCapturePayload) throws -> DisplayCatalogEntry? {
+        try DisplayCatalog.entry(
+            displayID: observationCapture.display_id,
+            bounds: observationCapture.capture_bounds.rect)
+    }
 
-        return intersection.width * intersection.height
+    nonisolated static func preferredObservedDisplayIndex(
+        observationCapture: ObservationCapturePayload,
+        validatedDisplay: DisplayCatalogEntry?) -> Int?
+    {
+        observationCapture.display_index ?? validatedDisplay?.index
     }
 
     private static func captureTarget(for app: String?) -> CaptureTarget {

@@ -1,19 +1,19 @@
+import type { RequestContext } from '@mastra/core/request-context';
 import { z } from 'zod';
 
 import {
-  type DesktopActionSuccess,
-  DesktopActionClientError,
-  desktopActionSuccessSchema,
-  desktopSeeSuccessSchema,
-} from '../tools/desktopActionClient';
+  withDesktopToolEventOrigin,
+} from '../tools/desktopObservability';
 import {
-  openTool,
-  seeTool,
-  switchApplicationsTool,
-  waitTool,
-} from '../tools/guiActionTools';
+  captureDesktopObservation,
+  type DesktopActionSuccess,
+  type DesktopWorkflowObservationRequest,
+  desktopActionSuccessSchema,
+  desktopWorkflowObservationSchema,
+} from '../tools/desktopActionClient';
 import { computerUseControlToolId } from '../tools/computerUseWorkerTools';
 import {
+  type ComputerUseWorkerArtifacts,
   type ComputerUseExecutedAction,
   type ComputerUseExecutionResult,
   type ComputerUseObservation,
@@ -30,8 +30,15 @@ import {
   computerUseWorkerToolCallSchema,
   computerUseWorkerToolResultSchema,
 } from './schemas';
+import {
+  createWorkerTurnRequestContext,
+  readTrackedWorkerTurn,
+} from './worker-turn-tracker';
 
-type RequestContextLike = Record<string, unknown> | undefined;
+type RequestContextLike =
+  | RequestContext<Record<string, unknown>>
+  | Record<string, unknown>
+  | undefined;
 
 type ExecutableTool = {
   execute?: (inputData: unknown, context?: { requestContext?: RequestContextLike }) => Promise<unknown>;
@@ -76,81 +83,27 @@ const normalizeAppCode = (value: string) => {
   return trimmed;
 };
 
-const isRecoverableWindowMissingError = (error: unknown) =>
-  error instanceof DesktopActionClientError &&
-  error.code === 'SERVER_UNAVAILABLE' &&
-  /window not found|has no windows or dialogs/i.test(error.message);
-
 const buildObservation = (
-  result: z.infer<typeof desktopSeeSuccessSchema>,
-  options?: {
-    summaryPrefix?: string;
-  },
+  result: z.infer<typeof desktopWorkflowObservationSchema>,
 ): ComputerUseObservation => {
-  const uiElements = result.ui_elements.slice(0, 20).map(element => ({
-    id: element.id,
-    role: element.role,
-    label: compactText(element.label),
-    title: compactText(element.title),
-    actionable: element.is_actionable,
-  }));
-
-  const summaryLines = [
-    ...(options?.summaryPrefix ? [options.summaryPrefix] : []),
-    `Application: ${result.application_name ?? 'unknown'}`,
-    `Window: ${result.window_title ?? 'unknown'}`,
-    `Capture mode: ${result.capture_mode}`,
-    `Elements: ${result.element_count} total, ${result.interactable_count} actionable`,
-  ];
-
-  if (uiElements.length > 0) {
-    summaryLines.push(
-      'Visible elements:',
-      ...uiElements.map(element => {
-        const text = element.label ?? element.title ?? 'no visible text';
-        return `- ${element.id} [${element.role}] ${text}${element.actionable ? ' (actionable)' : ''}`;
-      }),
-    );
-  }
+  const captureSpace = result.observation_capture;
 
   return {
-    snapshotId: result.snapshot_id,
     screenshotRawPath: result.screenshot_raw,
-    screenshotAnnotatedPath: result.screenshot_annotated,
     applicationName: compactText(result.application_name),
     windowTitle: compactText(result.window_title),
     captureMode: result.capture_mode,
-    elementCount: result.element_count,
-    interactableCount: result.interactable_count,
-    summaryText: summaryLines.join('\n'),
-    uiElements,
+    captureSpace:
+      captureSpace
+        ? {
+            displayId: captureSpace.display_id,
+            displayIndex: captureSpace.display_index,
+            bounds: captureSpace.capture_bounds,
+            imageWidth: captureSpace.image_size.width,
+            imageHeight: captureSpace.image_size.height,
+          }
+        : undefined,
   };
-};
-
-const ensureAppWindow = async (app: string, requestContext?: RequestContextLike) => {
-  const normalizedApp = normalizeAppCode(app);
-
-  try {
-    await invokeTool(
-      switchApplicationsTool as unknown as ExecutableTool,
-      { app_code: normalizedApp },
-      requestContext,
-    );
-  } catch {
-    // Switching alone is not sufficient for apps without open windows.
-  }
-
-  await invokeTool(
-    openTool as unknown as ExecutableTool,
-    { app_or_filename: normalizedApp },
-    requestContext,
-  );
-
-  try {
-    await invokeTool(waitTool as unknown as ExecutableTool, { time: 1 }, requestContext);
-  } catch {
-    // A failed wait should not block the follow-up observation attempt.
-  }
 };
 
 const normalizeWorkerToolCalls = (toolCalls: unknown): ComputerUseWorkerToolCall[] =>
@@ -247,71 +200,37 @@ export const captureObservation = async (
     requestContext?: RequestContextLike;
   } = {},
 ): Promise<ComputerUseObservation> => {
-  try {
-    const result = await invokeTool<z.infer<typeof desktopSeeSuccessSchema>>(
-      seeTool as unknown as ExecutableTool,
-      {
-        ...(params.app ? { app: params.app, mode: 'window' } : { mode: 'frontmost' }),
-        annotate: false,
-      },
-      params.requestContext,
-    );
+  const normalizedApp = params.app ? normalizeAppCode(params.app) : undefined;
+  const request: DesktopWorkflowObservationRequest = {
+    mode: 'screen',
+    annotate: false,
+    ...(normalizedApp ? { app: normalizedApp } : {}),
+  };
+  const result = await withDesktopToolEventOrigin('workflow-observation', async () =>
+    captureDesktopObservation(request),
+  );
 
-    return buildObservation(result);
-  } catch (error) {
-    if (!params.app || !isRecoverableWindowMissingError(error)) {
-      throw error;
-    }
-
-    await ensureAppWindow(params.app, params.requestContext);
-
-    try {
-      const reopenedResult = await invokeTool<z.infer<typeof desktopSeeSuccessSchema>>(
-        seeTool as unknown as ExecutableTool,
-        {
-          app: normalizeAppCode(params.app),
-          mode: 'window',
-          annotate: false,
-        },
-        params.requestContext,
-      );
-
-      return buildObservation(reopenedResult, {
-        summaryPrefix: `Requested app "${params.app}" had no open windows, so the workflow explicitly reopened or focused it before capturing this observation.`,
-      });
-    } catch (reopenError) {
-      if (!isRecoverableWindowMissingError(reopenError)) {
-        throw reopenError;
-      }
-
-      const fallbackResult = await invokeTool<z.infer<typeof desktopSeeSuccessSchema>>(
-        seeTool as unknown as ExecutableTool,
-        {
-          mode: 'screen',
-          annotate: false,
-        },
-        params.requestContext,
-      );
-
-      return buildObservation(fallbackResult, {
-        summaryPrefix: `Requested app "${params.app}" is running but still has no open windows or dialogs after an explicit reopen attempt. This observation is a full-screen fallback so the next action can recover.`,
-      });
-    }
-  }
+  return buildObservation(result);
 };
 
 export const extractComputerUseWorkerTurn = async ({
   result,
   currentTodo,
   currentScratchpad,
+  trackedTurn,
 }: {
   result: GenerateLike;
   currentTodo: ComputerUseTodoItem[];
   currentScratchpad: string[];
+  trackedTurn?: {
+    toolCalls: ComputerUseWorkerToolCall[];
+    toolResults: ComputerUseWorkerToolResult[];
+  } | null;
 }): Promise<ComputerUseWorkerTurn> => {
-  const normalizedToolCalls = normalizeWorkerToolCalls(result.toolCalls);
-  const resolvedToolResults = await Promise.resolve(result.toolResults);
-  const normalizedToolResults = normalizeWorkerToolResults(resolvedToolResults);
+  const normalizedToolCalls = trackedTurn?.toolCalls ?? normalizeWorkerToolCalls(result.toolCalls);
+  const normalizedToolResults =
+    trackedTurn?.toolResults ??
+    normalizeWorkerToolResults(await Promise.resolve(result.toolResults));
 
   const controlToolResult = [...normalizedToolResults]
     .reverse()
@@ -334,6 +253,26 @@ export const extractComputerUseWorkerTurn = async ({
     executedAction,
   };
 };
+
+export const buildWorkerArtifacts = (
+  workerTurn: ComputerUseWorkerTurn,
+): ComputerUseWorkerArtifacts => ({
+  text: workerTurn.text,
+  control: workerTurn.control,
+  toolCalls: workerTurn.toolCalls,
+  toolResults: workerTurn.toolResults,
+  executedAction: workerTurn.executedAction,
+  executionResult: workerTurn.executedAction?.executionResult ?? null,
+  grounding: workerTurn.executedAction?.grounding ?? null,
+});
+
+export const createWorkerRequestContext = (
+  requestContext: RequestContextLike,
+  observation: ComputerUseObservation,
+) => createWorkerTurnRequestContext(requestContext, observation);
+
+export const readWorkerTurnTracking = (requestContext: RequestContextLike) =>
+  readTrackedWorkerTurn(requestContext);
 
 export const deriveTargetAppFromWorkerTurn = (
   workerTurn: ComputerUseWorkerTurn | null,

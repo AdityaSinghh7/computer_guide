@@ -1,6 +1,7 @@
 import AppKit
 import CoreGraphics
 import Foundation
+import ImageIO
 import PeekabooAutomationKit
 import PeekabooFoundation
 
@@ -8,7 +9,7 @@ import PeekabooFoundation
 final class DesktopVisionService {
     private enum CaptureTarget {
         case frontmost
-        case screen(index: Int?)
+        case screen(index: Int?, app: String?, title: String?)
         case window(app: String, title: String?)
     }
 
@@ -139,6 +140,11 @@ final class DesktopVisionService {
 
         let applicationName = captureContext.result.metadata.applicationInfo?.name
         let windowTitle = captureContext.result.metadata.windowInfo?.title
+        let observationCapture = self.makeObservationCapturePayload(
+            captureContext: captureContext,
+            screenshotPath: screenshotPath,
+            applicationName: applicationName,
+            windowTitle: windowTitle)
 
         return SeeResponse(
             action_id: actionID,
@@ -156,6 +162,7 @@ final class DesktopVisionService {
             interactable_count: enabledElements.count,
             capture_mode: captureContext.mode,
             execution_time: Date().timeIntervalSince(startedAt),
+            observation_capture: observationCapture,
             ui_elements: detectionResult.elements.all.map(self.makeElementPayload))
     }
 
@@ -163,7 +170,10 @@ final class DesktopVisionService {
         let explicitMode = request.mode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
 
         if explicitMode == "screen" {
-            return .screen(index: nil)
+            return .screen(
+                index: request.display_index,
+                app: request.app?.trimmingCharacters(in: .whitespacesAndNewlines),
+                title: request.window_title)
         }
         if explicitMode == "frontmost" {
             return .frontmost
@@ -197,8 +207,12 @@ final class DesktopVisionService {
                 shouldFocusWebContent: true)
             return CaptureContext(result: result, windowContext: context, mode: "frontmost")
 
-        case let .screen(index):
-            let result = try await self.screenCaptureService.captureScreen(displayIndex: index)
+        case let .screen(index, app, title):
+            let displayIndex = try await self.resolveDisplayIndex(
+                requestedIndex: index,
+                app: app,
+                title: title)
+            let result = try await self.screenCaptureService.captureScreen(displayIndex: displayIndex)
             return CaptureContext(result: result, windowContext: nil, mode: "screen")
 
         case let .window(app, title):
@@ -230,6 +244,73 @@ final class DesktopVisionService {
         return windows.first?.windowID
     }
 
+    private func resolveDisplayIndex(
+        requestedIndex: Int?,
+        app: String?,
+        title: String?) async throws -> Int?
+    {
+        if let requestedIndex {
+            return requestedIndex
+        }
+
+        guard let app, !app.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let windowsResult: Result<[ServiceWindowInfo], Error>
+        do {
+            windowsResult = .success(try await self.windowService.listWindows(
+                target: Self.windowTarget(app: app, title: title)))
+        } catch {
+            windowsResult = .failure(error)
+        }
+        return Self.bestEffortPreferredDisplayIndex(from: windowsResult)
+    }
+
+    nonisolated static func preferredDisplayIndex(from windows: [ServiceWindowInfo]) -> Int? {
+        windows
+            .filter { !$0.isMinimized && !$0.isOffScreen }
+            .sorted(by: Self.compareWindowPriority)
+            .first?.screenIndex
+            ?? windows.sorted(by: Self.compareWindowPriority).first?.screenIndex
+    }
+
+    nonisolated static func bestEffortPreferredDisplayIndex(
+        from windowsResult: Result<[ServiceWindowInfo], Error>) -> Int?
+    {
+        switch windowsResult {
+        case let .success(windows):
+            return Self.preferredDisplayIndex(from: windows)
+        case .failure:
+            return nil
+        }
+    }
+
+    private static func windowTarget(app: String, title: String?) -> WindowTarget {
+        if let title, !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return .applicationAndTitle(app: app, title: title)
+        }
+        return .application(app)
+    }
+
+    nonisolated private static func compareWindowPriority(_ lhs: ServiceWindowInfo, _ rhs: ServiceWindowInfo) -> Bool {
+        if lhs.isMainWindow != rhs.isMainWindow {
+            return lhs.isMainWindow && !rhs.isMainWindow
+        }
+        if lhs.isOnScreen != rhs.isOnScreen {
+            return lhs.isOnScreen && !rhs.isOnScreen
+        }
+        if lhs.index != rhs.index {
+            return lhs.index < rhs.index
+        }
+        let lhsArea = lhs.bounds.width * lhs.bounds.height
+        let rhsArea = rhs.bounds.width * rhs.bounds.height
+        if lhsArea != rhsArea {
+            return lhsArea > rhsArea
+        }
+        return lhs.windowID < rhs.windowID
+    }
+
     private func saveScreenshot(imageData: Data, requestedPath: String?) throws -> String {
         let outputPath: String
         if let requestedPath, !requestedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -248,6 +329,49 @@ final class DesktopVisionService {
         return outputPath
     }
 
+    private func makeObservationCapturePayload(
+        captureContext: CaptureContext,
+        screenshotPath: String,
+        applicationName: String?,
+        windowTitle: String?) -> ObservationCapturePayload?
+    {
+        guard captureContext.mode == "screen" else {
+            return nil
+        }
+
+        let imageSize = Self.imagePixelSize(
+            from: captureContext.result.imageData,
+            fallback: captureContext.result.metadata.size)
+        guard imageSize.width > 0, imageSize.height > 0 else {
+            return nil
+        }
+
+        let captureDisplayInfo = captureContext.result.metadata.displayInfo
+        let captureDisplayIndex = captureDisplayInfo?.index
+        let matchedDisplay = try? DisplayCatalog.entry(
+            displayID: nil,
+            bounds: captureDisplayInfo?.bounds)
+        guard let captureBounds = captureDisplayInfo?.bounds ?? matchedDisplay?.bounds else {
+            return nil
+        }
+
+        guard captureBounds.width > 0,
+              captureBounds.height > 0
+        else {
+            return nil
+        }
+
+        return ObservationCapturePayload(
+            screenshot_path: screenshotPath,
+            capture_mode: captureContext.mode,
+            display_id: matchedDisplay?.id,
+            display_index: captureDisplayIndex ?? matchedDisplay?.index,
+            capture_bounds: BoundsPayload(rect: captureBounds),
+            image_size: SizePayload(size: imageSize),
+            application: applicationName,
+            window: windowTitle)
+    }
+
     private func makeElementPayload(_ element: DetectedElement) -> SeeElementPayload {
         SeeElementPayload(
             id: element.id,
@@ -260,5 +384,19 @@ final class DesktopVisionService {
             identifier: element.attributes["identifier"],
             is_actionable: element.isEnabled,
             keyboard_shortcut: element.attributes["keyboardShortcut"])
+    }
+
+    private static func imagePixelSize(from imageData: Data, fallback: CGSize) -> CGSize {
+        guard let source = CGImageSourceCreateWithData(imageData as CFData, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber,
+              width.doubleValue > 0,
+              height.doubleValue > 0
+        else {
+            return fallback
+        }
+
+        return CGSize(width: width.doubleValue, height: height.doubleValue)
     }
 }

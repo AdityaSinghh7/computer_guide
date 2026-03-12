@@ -2,6 +2,11 @@ import { createTool } from '@mastra/core/tools';
 
 import { computerUseWorkflow } from '../computer-use/workflow';
 import {
+  appendRunTimelineEvent,
+  initializeRunTimeline,
+  withObservabilityRun,
+} from '../observability/runTimeline';
+import {
   createInitialComputerUseState,
   computerUseRequestSchema,
   computerUseResumeRequestSchema,
@@ -76,6 +81,50 @@ const mapWorkflowResult = (
   };
 };
 
+const recordWorkflowLifecycleEvent = async (
+  workflowRunId: string,
+  phase: 'started' | 'resumed' | 'completed' | 'failed' | 'suspended',
+  details: Record<string, unknown>,
+) => {
+  const description =
+    phase === 'started'
+      ? {
+          title: 'Workflow run created',
+          summary: 'Started a new computer-use workflow run.',
+        }
+      : phase === 'resumed'
+        ? {
+            title: 'Workflow run resumed',
+            summary: 'Resumed the existing workflow run after a handoff. This is not a new run.',
+          }
+        : phase === 'suspended'
+          ? {
+              title: 'Workflow run suspended',
+              summary: 'Paused the existing workflow run and is waiting for user input.',
+            }
+          : phase === 'completed'
+            ? {
+                title: 'Workflow run completed',
+                summary: 'Finished the existing workflow run successfully.',
+              }
+            : {
+                title: 'Workflow run failed',
+                summary: 'Stopped the existing workflow run because it could not continue.',
+              };
+
+  await appendRunTimelineEvent(workflowRunId, {
+    type: 'run',
+    title: description.title,
+    outcome:
+      phase === 'failed' ? 'error' : phase === 'completed' ? 'success' : 'info',
+    summary: description.summary,
+    details: {
+      phase,
+      ...details,
+    },
+  });
+};
+
 export const runComputerUseTool = createTool({
   id: 'run_computer_use',
   description:
@@ -86,16 +135,37 @@ export const runComputerUseTool = createTool({
     const run = await computerUseWorkflow.createRun(
       input.resourceId ? { resourceId: input.resourceId } : undefined,
     );
-    const result = (await run.start({
-      inputData: input,
-      initialState: createInitialComputerUseState(input.maxIterations, input.maxRecoveryAttempts),
-      requestContext: context?.requestContext,
-      outputOptions: {
-        includeState: true,
+    await initializeRunTimeline(run.runId, {
+      title: `Computer Use Run ${run.runId}`,
+      metadata: {
+        kind: 'computer-use',
+        phase: 'start',
+        resourceId: input.resourceId ?? null,
       },
-    })) as ComputerUseRunResult;
+    });
+    await recordWorkflowLifecycleEvent(run.runId, 'started', {
+      input,
+    });
 
-    return mapWorkflowResult(run.runId, result);
+    const result = await withObservabilityRun(run.runId, async () =>
+      (await run.start({
+        inputData: input,
+        initialState: createInitialComputerUseState(input.maxIterations, input.maxRecoveryAttempts),
+        requestContext: context?.requestContext,
+        outputOptions: {
+          includeState: true,
+        },
+      })) as ComputerUseRunResult,
+    );
+
+    const mapped = mapWorkflowResult(run.runId, result);
+    await recordWorkflowLifecycleEvent(run.runId, mapped.status, {
+      finalResponse: mapped.finalResponse,
+      totalSteps: mapped.totalSteps,
+      handoff: mapped.handoff,
+    });
+
+    return mapped;
   },
 });
 
@@ -107,18 +177,40 @@ export const resumeComputerUseTool = createTool({
   outputSchema: computerUseWorkflowOutputSchema,
   execute: async (input, context) => {
     const run = await computerUseWorkflow.createRun({ runId: input.runId });
-    const result = (await run.resume({
-      ...(input.suspendedPath ? { step: input.suspendedPath } : {}),
-      resumeData: {
-        action: input.action,
-        userResponse: input.userResponse,
+    await initializeRunTimeline(run.runId, {
+      title: `Computer Use Run ${run.runId}`,
+      metadata: {
+        kind: 'computer-use',
+        phase: 'resume',
       },
-      requestContext: context?.requestContext,
-      outputOptions: {
-        includeState: true,
-      },
-    })) as ComputerUseRunResult;
+    });
 
-    return mapWorkflowResult(run.runId, result);
+    const result = await withObservabilityRun(run.runId, async () =>
+      (await run.resume({
+        ...(input.suspendedPath ? { step: input.suspendedPath } : {}),
+        resumeData: {
+          action: input.action,
+          userResponse: input.userResponse,
+        },
+        requestContext: context?.requestContext,
+        outputOptions: {
+          includeState: true,
+        },
+      })) as ComputerUseRunResult,
+    );
+
+    await recordWorkflowLifecycleEvent(run.runId, 'resumed', {
+      action: input.action,
+      suspendedPath: input.suspendedPath ?? null,
+    });
+
+    const mapped = mapWorkflowResult(run.runId, result);
+    await recordWorkflowLifecycleEvent(run.runId, mapped.status, {
+      finalResponse: mapped.finalResponse,
+      totalSteps: mapped.totalSteps,
+      handoff: mapped.handoff,
+    });
+
+    return mapped;
   },
 });

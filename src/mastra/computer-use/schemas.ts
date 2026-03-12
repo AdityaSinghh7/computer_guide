@@ -167,25 +167,25 @@ export const computerUseWorkerControlSchema = z.object({
   handoff: computerUseHandoffSchema.nullable().optional(),
 });
 
-export const computerUseUiElementSummarySchema = z.object({
-  id: z.string(),
-  role: z.string(),
-  label: z.string().optional(),
-  title: z.string().optional(),
-  actionable: z.boolean(),
-});
-
 export const computerUseObservationSchema = z.object({
-  snapshotId: z.string(),
   screenshotRawPath: z.string(),
-  screenshotAnnotatedPath: z.string(),
   applicationName: z.string().optional(),
   windowTitle: z.string().optional(),
   captureMode: z.string(),
-  elementCount: z.number().int().nonnegative(),
-  interactableCount: z.number().int().nonnegative(),
-  summaryText: z.string(),
-  uiElements: z.array(computerUseUiElementSummarySchema),
+  captureSpace: z
+    .object({
+      displayId: z.number().int().nonnegative().optional(),
+      displayIndex: z.number().int().nonnegative().optional(),
+      bounds: z.object({
+        x: z.number(),
+        y: z.number(),
+        width: z.number(),
+        height: z.number(),
+      }),
+      imageWidth: z.number().int().positive(),
+      imageHeight: z.number().int().positive(),
+    })
+    .optional(),
 });
 
 export const computerUseGroundingArtifactSchema = z.object({
@@ -240,6 +240,16 @@ export const computerUseWorkerTurnSchema = z.object({
   executedAction: computerUseExecutedActionSchema.nullable(),
 });
 
+export const computerUseWorkerArtifactsSchema = z.object({
+  text: z.string(),
+  control: computerUseWorkerControlSchema,
+  toolCalls: z.array(computerUseWorkerToolCallSchema),
+  toolResults: z.array(computerUseWorkerToolResultSchema),
+  executedAction: computerUseExecutedActionSchema.nullable(),
+  executionResult: computerUseExecutionResultSchema.nullable(),
+  grounding: computerUseGroundingArtifactSchema.nullable(),
+});
+
 export const computerUseVerificationSchema = z.object({
   verdict: z.enum(['success', 'uncertain', 'failed']),
   summary: z.string(),
@@ -253,6 +263,7 @@ export const computerUseVerificationSchema = z.object({
 export const computerUseStepArtifactSchema = z.object({
   stepIndex: z.number().int().positive(),
   beforeObservation: computerUseObservationSchema,
+  latestWorkerObservation: computerUseObservationSchema,
   workerTurn: computerUseWorkerTurnSchema,
   grounding: computerUseGroundingArtifactSchema.nullable(),
   executionResult: computerUseExecutionResultSchema.nullable(),
@@ -290,6 +301,8 @@ export const computerUseWorkflowStateSchema = z.object({
   maxRecoveryAttempts: z.number().int().nonnegative(),
   currentObservation: computerUseObservationSchema.nullable(),
   pendingBeforeObservation: computerUseObservationSchema.nullable(),
+  pendingLatestWorkerObservation: computerUseObservationSchema.nullable(),
+  pendingWorkerArtifacts: computerUseWorkerArtifactsSchema.nullable(),
   pendingWorkerTurn: computerUseWorkerTurnSchema.nullable(),
   pendingGrounding: computerUseGroundingArtifactSchema.nullable(),
   pendingExecutionResult: computerUseExecutionResultSchema.nullable(),
@@ -301,6 +314,8 @@ export const computerUseWorkflowStateSchema = z.object({
   recoveryHint: z.string().optional(),
   resumeContext: z.string().optional(),
   pendingHandoff: computerUseHandoffSchema.nullable(),
+  latestWorkerObservation: computerUseObservationSchema.nullable(),
+  latestWorkerArtifacts: computerUseWorkerArtifactsSchema.nullable(),
   latestWorkerTurn: computerUseWorkerTurnSchema.nullable(),
   latestExecutionResult: computerUseExecutionResultSchema.nullable(),
   latestVerification: computerUseVerificationSchema.nullable(),
@@ -333,6 +348,7 @@ export type ComputerUseWorkerControl = z.infer<typeof computerUseWorkerControlSc
 export type ComputerUseWorkerToolCall = z.infer<typeof computerUseWorkerToolCallSchema>;
 export type ComputerUseWorkerToolResult = z.infer<typeof computerUseWorkerToolResultSchema>;
 export type ComputerUseWorkerTurn = z.infer<typeof computerUseWorkerTurnSchema>;
+export type ComputerUseWorkerArtifacts = z.infer<typeof computerUseWorkerArtifactsSchema>;
 export type ComputerUseWorkflowInput = z.infer<typeof computerUseRequestSchema>;
 export type ComputerUseWorkflowOutput = z.infer<typeof computerUseWorkflowOutputSchema>;
 export type ComputerUseWorkflowState = z.infer<typeof computerUseWorkflowStateSchema>;
@@ -349,6 +365,8 @@ export const createInitialComputerUseState = (
   maxRecoveryAttempts,
   currentObservation: null,
   pendingBeforeObservation: null,
+  pendingLatestWorkerObservation: null,
+  pendingWorkerArtifacts: null,
   pendingWorkerTurn: null,
   pendingGrounding: null,
   pendingExecutionResult: null,
@@ -360,6 +378,8 @@ export const createInitialComputerUseState = (
   recoveryHint: undefined,
   resumeContext: undefined,
   pendingHandoff: null,
+  latestWorkerObservation: null,
+  latestWorkerArtifacts: null,
   latestWorkerTurn: null,
   latestExecutionResult: null,
   latestVerification: null,

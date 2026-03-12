@@ -1,16 +1,21 @@
+import type { RequestContext } from '@mastra/core/request-context';
 import { createStep, createWorkflow } from '@mastra/core/workflows';
 
 import { computerUseVerifierAgent } from '../agents/computer-use-verifier-agent';
 import { computerUseWorkerAgent } from '../agents/computer-use-worker-agent';
 import {
+  buildWorkerArtifacts,
   captureObservation,
+  createWorkerRequestContext,
   deriveTargetAppFromWorkerTurn,
   extractComputerUseWorkerTurn,
+  readWorkerTurnTracking,
 } from './action-dispatch';
 import { buildVerifierMessages, buildWorkerMessages } from './helpers';
 import {
   type ComputerUseControl,
   type ComputerUseHandoff,
+  type ComputerUseObservation,
   type ComputerUseResumePayload,
   type ComputerUseStepArtifact,
   type ComputerUseTodoItem,
@@ -29,12 +34,73 @@ import {
   createInitialComputerUseState,
 } from './schemas';
 
-type RequestContextLike = Record<string, unknown> | undefined;
+type RequestContextLike =
+  | RequestContext<Record<string, unknown>>
+  | Record<string, unknown>
+  | undefined;
+
+type RunTimelineEventPayload = Record<string, unknown>;
+
+type RunTimelineEventInput = {
+  runId: string;
+  event: {
+    type: string;
+    timestamp: string;
+    payload: RunTimelineEventPayload;
+  };
+};
+
+type RunTimelineModule = {
+  appendRunTimelineEvent?: (input: RunTimelineEventInput) => Promise<void> | void;
+  recordRunTimelineEvent?: (input: RunTimelineEventInput) => Promise<void> | void;
+};
 
 const toRequestContext = (value: unknown): RequestContextLike =>
   value as Record<string, unknown> | undefined;
 
 const MAX_SCRATCHPAD_LINES = 8;
+const runTimelineModulePath = '../observability/runTimeline';
+
+const loadRunTimelineModule = async (): Promise<RunTimelineModule | null> => {
+  try {
+    return (await import(runTimelineModulePath)) as RunTimelineModule;
+  } catch {
+    return null;
+  }
+};
+
+const appendRunTimelineEvent = async (
+  runId: string | undefined,
+  type: string,
+  payload: RunTimelineEventPayload,
+) => {
+  if (!runId?.trim()) {
+    return;
+  }
+
+  try {
+    const module = await loadRunTimelineModule();
+    const input: RunTimelineEventInput = {
+      runId,
+      event: {
+        type,
+        timestamp: new Date().toISOString(),
+        payload,
+      },
+    };
+
+    if (module?.appendRunTimelineEvent) {
+      await module.appendRunTimelineEvent(input);
+      return;
+    }
+
+    if (module?.recordRunTimelineEvent) {
+      await module.recordRunTimelineEvent(input);
+    }
+  } catch {
+    // Observability is best-effort and should never block workflow execution.
+  }
+};
 
 const defaultVerification = (): ComputerUseVerification => ({
   verdict: 'uncertain',
@@ -103,9 +169,65 @@ const buildFallbackHandoff = ({
     `What should I do next?${observationSummary ? ` Current view: ${observationSummary}` : ''}`,
 });
 
+const summarizeObservationForHandoff = (observation: ComputerUseObservation) =>
+  [
+    observation.applicationName ?? null,
+    observation.windowTitle ?? null,
+    observation.captureMode,
+  ]
+    .filter(Boolean)
+    .join(' / ');
+
+const recordWorkflowTurnArtifact = async ({
+  runId,
+  request,
+  app,
+  artifact,
+  workflowStatus,
+  recoveryCount,
+  recoveryHint,
+  handoff,
+}: {
+  runId: string | undefined;
+  request: string;
+  app?: string;
+  artifact: ComputerUseStepArtifact;
+  workflowStatus: ComputerUseWorkflowState['status'];
+  recoveryCount: number;
+  recoveryHint?: string;
+  handoff?: ComputerUseHandoff | null;
+}) =>
+  appendRunTimelineEvent(runId, 'workflow-turn', {
+    request,
+    app: app ?? null,
+    stepIndex: artifact.stepIndex,
+    workflowStatus,
+    recoveryCount,
+    recoveryHint: recoveryHint ?? null,
+    terminationSignal: artifact.terminationSignal,
+    taskTodo: artifact.taskTodo,
+    scratchpad: artifact.scratchpad,
+    handoff: handoff ?? null,
+    beforeObservation: artifact.beforeObservation,
+    latestWorkerObservation: artifact.latestWorkerObservation,
+    afterObservation: artifact.afterObservation,
+    executionResult: artifact.executionResult,
+    grounding: artifact.grounding,
+    verification: artifact.verification,
+    workerTurn: {
+      text: artifact.workerTurn.text,
+      control: artifact.workerTurn.control,
+      toolCalls: artifact.workerTurn.toolCalls,
+      toolResults: artifact.workerTurn.toolResults,
+      executedAction: artifact.workerTurn.executedAction,
+    },
+  });
+
 const withClearedPendingState = (state: ComputerUseWorkflowState): ComputerUseWorkflowState => ({
   ...state,
   pendingBeforeObservation: null,
+  pendingLatestWorkerObservation: null,
+  pendingWorkerArtifacts: null,
   pendingWorkerTurn: null,
   pendingGrounding: null,
   pendingExecutionResult: null,
@@ -153,6 +275,7 @@ const prepareTurnStep = createStep({
       currentObservation: beforeObservation,
       pendingHandoff: null,
       pendingBeforeObservation: beforeObservation,
+      pendingLatestWorkerObservation: beforeObservation,
     });
 
     return {
@@ -183,6 +306,11 @@ const workerTurnStep = createStep({
   outputSchema: computerUseTurnContextSchema,
   stateSchema: computerUseWorkflowStateSchema,
   execute: async ({ inputData, state, setState, requestContext }) => {
+    const workerRequestContext = createWorkerRequestContext(
+      toRequestContext(requestContext),
+      inputData.beforeObservation,
+    );
+
     const workerResult = await computerUseWorkerAgent.generate(
       (await buildWorkerMessages({
         task: inputData.request,
@@ -202,7 +330,7 @@ const workerTurnStep = createStep({
         modelSettings: {
           temperature: 0,
         },
-        requestContext,
+        requestContext: workerRequestContext,
       },
     );
 
@@ -214,20 +342,23 @@ const workerTurnStep = createStep({
       result: workerResult as { text?: string; toolCalls?: unknown; toolResults?: unknown },
       currentTodo: inputData.taskTodo,
       currentScratchpad: inputData.scratchpad,
+      trackedTurn: readWorkerTurnTracking(workerRequestContext),
     });
+    const workerArtifacts = buildWorkerArtifacts(workerTurn);
 
     await setState({
       ...state,
+      pendingWorkerArtifacts: workerArtifacts,
       pendingWorkerTurn: workerTurn,
-      pendingExecutionResult: workerTurn.executedAction?.executionResult ?? null,
-      pendingGrounding: workerTurn.executedAction?.grounding ?? null,
+      pendingExecutionResult: workerArtifacts.executionResult,
+      pendingGrounding: workerArtifacts.grounding,
     });
 
     return {
       ...inputData,
       workerTurn,
-      executionResult: workerTurn.executedAction?.executionResult ?? null,
-      grounding: workerTurn.executedAction?.grounding ?? null,
+      executionResult: workerArtifacts.executionResult,
+      grounding: workerArtifacts.grounding,
     };
   },
 });
@@ -239,7 +370,12 @@ const observeAfterActionStep = createStep({
   outputSchema: computerUseTurnContextSchema,
   stateSchema: computerUseWorkflowStateSchema,
   execute: async ({ inputData, requestContext, state, setState }) => {
-    if (!inputData.workerTurn?.executedAction) {
+    const workerArtifacts = state.pendingWorkerArtifacts;
+    if (!workerArtifacts) {
+      throw new Error('computer-use turn is missing the persisted worker artifacts');
+    }
+
+    if (!workerArtifacts.executedAction) {
       await setState({
         ...state,
         pendingAfterObservation: inputData.beforeObservation,
@@ -252,7 +388,13 @@ const observeAfterActionStep = createStep({
     }
 
     const targetApp = deriveTargetAppFromWorkerTurn(
-      inputData.workerTurn,
+      {
+        text: workerArtifacts.text,
+        control: workerArtifacts.control,
+        toolCalls: workerArtifacts.toolCalls,
+        toolResults: workerArtifacts.toolResults,
+        executedAction: workerArtifacts.executedAction,
+      },
       inputData.beforeObservation.applicationName ?? inputData.app,
     );
     const afterObservation = await captureObservation({
@@ -279,11 +421,17 @@ const verifyActionStep = createStep({
   outputSchema: computerUseTurnContextSchema,
   stateSchema: computerUseWorkflowStateSchema,
   execute: async ({ inputData, state, setState }) => {
-    if (!inputData.workerTurn?.executedAction) {
+    const workerArtifacts = state.pendingWorkerArtifacts;
+    if (!workerArtifacts) {
+      throw new Error('computer-use turn is missing the persisted worker artifacts');
+    }
+
+    if (!workerArtifacts.executedAction) {
       return inputData;
     }
 
-    if (!inputData.afterObservation) {
+    const afterObservation = state.pendingAfterObservation ?? inputData.afterObservation;
+    if (!afterObservation) {
       throw new Error('computer-use turn is missing the post-action observation');
     }
 
@@ -293,10 +441,17 @@ const verifyActionStep = createStep({
         artifact: {
           stepIndex: inputData.stepIndex,
           beforeObservation: inputData.beforeObservation,
-          workerTurn: inputData.workerTurn,
-          grounding: inputData.grounding,
-          executionResult: inputData.executionResult,
-          afterObservation: inputData.afterObservation,
+          latestWorkerObservation: state.pendingLatestWorkerObservation ?? inputData.beforeObservation,
+          workerTurn: {
+            text: workerArtifacts.text,
+            control: workerArtifacts.control,
+            toolCalls: workerArtifacts.toolCalls,
+            toolResults: workerArtifacts.toolResults,
+            executedAction: workerArtifacts.executedAction,
+          },
+          grounding: workerArtifacts.grounding,
+          executionResult: workerArtifacts.executionResult,
+          afterObservation,
           verification: null,
           taskTodo: inputData.taskTodo,
           scratchpad: inputData.scratchpad,
@@ -329,6 +484,16 @@ const verifyActionStep = createStep({
 
     return {
       ...inputData,
+      workerTurn: {
+        text: workerArtifacts.text,
+        control: workerArtifacts.control,
+        toolCalls: workerArtifacts.toolCalls,
+        toolResults: workerArtifacts.toolResults,
+        executedAction: workerArtifacts.executedAction,
+      },
+      grounding: workerArtifacts.grounding,
+      executionResult: workerArtifacts.executionResult,
+      afterObservation,
       verification,
     };
   },
@@ -343,23 +508,34 @@ const concludeTurnStep = createStep({
   resumeSchema: computerUseResumePayloadSchema,
   suspendSchema: computerUseHandoffSchema,
   execute: async ({ inputData, state, setState, resumeData, suspend }) => {
-    const workerTurn = inputData.workerTurn;
-    if (!workerTurn) {
-      throw new Error('computer-use turn is missing the worker turn result');
+    const workerArtifacts = state.pendingWorkerArtifacts;
+    if (!workerArtifacts) {
+      throw new Error('computer-use turn is missing the persisted worker artifacts');
     }
+    const workerTurn = {
+      text: workerArtifacts.text,
+      control: workerArtifacts.control,
+      toolCalls: workerArtifacts.toolCalls,
+      toolResults: workerArtifacts.toolResults,
+      executedAction: workerArtifacts.executedAction,
+    };
 
     const control = workerTurn.control;
     const taskTodo = resolveTaskTodo(control, state.taskTodo);
     const scratchpad = resolveScratchpad(control, state.scratchpad);
-    const afterObservation = inputData.afterObservation ?? inputData.beforeObservation;
-    const verification = inputData.verification ?? null;
+    const afterObservation =
+      state.pendingAfterObservation ?? inputData.afterObservation ?? inputData.beforeObservation;
+    const verification = state.pendingVerification ?? inputData.verification ?? null;
+    const latestWorkerObservation =
+      state.pendingLatestWorkerObservation ?? inputData.beforeObservation;
 
     const baseArtifact: ComputerUseStepArtifact = {
       stepIndex: inputData.stepIndex,
       beforeObservation: inputData.beforeObservation,
+      latestWorkerObservation,
       workerTurn,
-      grounding: inputData.grounding,
-      executionResult: inputData.executionResult,
+      grounding: workerArtifacts.grounding,
+      executionResult: workerArtifacts.executionResult,
       afterObservation,
       verification,
       taskTodo,
@@ -376,9 +552,20 @@ const concludeTurnStep = createStep({
           currentObservation: afterObservation,
           pendingHandoff: null,
           resumeContext: resumePayload.userResponse,
+          latestWorkerObservation,
           finalResponse:
             resumePayload.userResponse ||
             'The computer-use run was stopped after human handoff.',
+        });
+        await recordWorkflowTurnArtifact({
+          runId: state.workflowRunId,
+          request: inputData.request,
+          app: inputData.app,
+          artifact: { ...baseArtifact, terminationSignal: 'failed' },
+          workflowStatus: 'failed',
+          recoveryCount: state.recoveryCount,
+          recoveryHint: resumePayload.userResponse,
+          handoff: null,
         });
 
         return {
@@ -400,6 +587,7 @@ const concludeTurnStep = createStep({
         recoveryCount: 0,
         recoveryHint: resumePayload.userResponse,
         resumeContext: resumePayload.userResponse,
+        latestWorkerObservation,
         finalResponse: undefined,
       });
 
@@ -415,6 +603,7 @@ const concludeTurnStep = createStep({
     if (control.status === 'done' || control.status === 'cannot_complete') {
       if (control.handoff) {
         const handoff = control.handoff;
+        const handoffArtifact = { ...baseArtifact, terminationSignal: 'handoff' } as const;
 
         await setState({
           ...withClearedPendingState(state),
@@ -426,18 +615,32 @@ const concludeTurnStep = createStep({
           recoveryCount: state.recoveryCount,
           recoveryHint: control.userMessage,
           pendingHandoff: handoff,
+          latestWorkerObservation,
+          latestWorkerArtifacts: workerArtifacts,
           latestWorkerTurn: workerTurn,
-          latestExecutionResult: inputData.executionResult,
+          latestExecutionResult: workerArtifacts.executionResult,
           latestVerification: verification,
           finalResponse: handoff.summary,
-          steps: [...state.steps, { ...baseArtifact, terminationSignal: 'handoff' }],
+          steps: [...state.steps, handoffArtifact],
+        });
+        await recordWorkflowTurnArtifact({
+          runId: state.workflowRunId,
+          request: inputData.request,
+          app: inputData.app,
+          artifact: handoffArtifact,
+          workflowStatus: 'suspended',
+          recoveryCount: state.recoveryCount,
+          recoveryHint: control.userMessage,
+          handoff,
         });
 
         return suspend(handoff, { resumeLabel: 'computer-use-handoff' });
       }
 
-      const terminationSignal = control.status === 'done' ? 'done' : 'failed';
+      const terminationSignal: ComputerUseStepArtifact['terminationSignal'] =
+        control.status === 'done' ? 'done' : 'failed';
       const status = control.status === 'done' ? 'completed' : 'failed';
+      const terminalArtifact: ComputerUseStepArtifact = { ...baseArtifact, terminationSignal };
 
       await setState({
         ...withClearedPendingState(state),
@@ -450,8 +653,10 @@ const concludeTurnStep = createStep({
         recoveryHint: undefined,
         resumeContext: undefined,
         pendingHandoff: null,
+        latestWorkerObservation,
+        latestWorkerArtifacts: workerArtifacts,
         latestWorkerTurn: workerTurn,
-        latestExecutionResult: inputData.executionResult,
+        latestExecutionResult: workerArtifacts.executionResult,
         latestVerification: verification,
         finalResponse:
           control.userMessage ??
@@ -459,7 +664,17 @@ const concludeTurnStep = createStep({
           (status === 'completed'
             ? 'The requested computer task appears complete.'
             : 'The requested computer task could not be completed.'),
-        steps: [...state.steps, { ...baseArtifact, terminationSignal }],
+        steps: [...state.steps, terminalArtifact],
+      });
+      await recordWorkflowTurnArtifact({
+        runId: state.workflowRunId,
+        request: inputData.request,
+        app: inputData.app,
+        artifact: terminalArtifact,
+        workflowStatus: status,
+        recoveryCount: 0,
+        recoveryHint: undefined,
+        handoff: null,
       });
 
       return {
@@ -505,8 +720,13 @@ const concludeTurnStep = createStep({
         buildFallbackHandoff({
           workerTurn,
           verification: effectiveVerification,
-          observationSummary: afterObservation.summaryText,
+          observationSummary: summarizeObservationForHandoff(afterObservation),
         });
+      const handoffArtifact = {
+        ...baseArtifact,
+        verification: effectiveVerification,
+        terminationSignal: 'handoff',
+      } as const;
 
       await setState({
         ...withClearedPendingState(state),
@@ -518,20 +738,34 @@ const concludeTurnStep = createStep({
         recoveryCount: state.recoveryCount,
         recoveryHint: effectiveVerification.nextHint,
         pendingHandoff: handoff,
+        latestWorkerObservation,
+        latestWorkerArtifacts: workerArtifacts,
         latestWorkerTurn: workerTurn,
-        latestExecutionResult: inputData.executionResult,
+        latestExecutionResult: workerArtifacts.executionResult,
         latestVerification: effectiveVerification,
         finalResponse: handoff.summary,
-        steps: [
-          ...state.steps,
-          { ...baseArtifact, verification: effectiveVerification, terminationSignal: 'handoff' },
-        ],
+        steps: [...state.steps, handoffArtifact],
+      });
+      await recordWorkflowTurnArtifact({
+        runId: state.workflowRunId,
+        request: inputData.request,
+        app: inputData.app,
+        artifact: handoffArtifact,
+        workflowStatus: 'suspended',
+        recoveryCount: state.recoveryCount,
+        recoveryHint: effectiveVerification.nextHint,
+        handoff,
       });
 
       return suspend(handoff, { resumeLabel: 'computer-use-handoff' });
     }
 
     if (wantsRetry) {
+      const retryArtifact = {
+        ...baseArtifact,
+        verification: effectiveVerification,
+        terminationSignal: 'continue',
+      } as const;
       await setState({
         ...withClearedPendingState(state),
         status: 'running',
@@ -544,14 +778,26 @@ const concludeTurnStep = createStep({
           effectiveVerification.nextHint ??
           effectiveVerification.recoveryReason ??
           effectiveVerification.summary,
+        latestWorkerObservation,
+        latestWorkerArtifacts: workerArtifacts,
         latestWorkerTurn: workerTurn,
-        latestExecutionResult: inputData.executionResult,
+        latestExecutionResult: workerArtifacts.executionResult,
         latestVerification: effectiveVerification,
         finalResponse: undefined,
-        steps: [
-          ...state.steps,
-          { ...baseArtifact, verification: effectiveVerification, terminationSignal: 'continue' },
-        ],
+        steps: [...state.steps, retryArtifact],
+      });
+      await recordWorkflowTurnArtifact({
+        runId: state.workflowRunId,
+        request: inputData.request,
+        app: inputData.app,
+        artifact: retryArtifact,
+        workflowStatus: 'running',
+        recoveryCount: state.recoveryCount + 1,
+        recoveryHint:
+          effectiveVerification.nextHint ??
+          effectiveVerification.recoveryReason ??
+          effectiveVerification.summary,
+        handoff: null,
       });
 
       return {
@@ -590,6 +836,11 @@ const concludeTurnStep = createStep({
           (maxReached
             ? `I reached the current computer-use step limit of ${inputData.maxIterations} without finishing the task.`
             : effectiveVerification.summary);
+    const continuedArtifact = {
+      ...baseArtifact,
+      verification: effectiveVerification,
+      terminationSignal,
+    };
 
     await setState({
       ...withClearedPendingState(state),
@@ -602,14 +853,23 @@ const concludeTurnStep = createStep({
       recoveryHint: workflowStatus === 'running' ? undefined : state.recoveryHint,
       resumeContext: undefined,
       pendingHandoff: null,
+      latestWorkerObservation,
+      latestWorkerArtifacts: workerArtifacts,
       latestWorkerTurn: workerTurn,
-      latestExecutionResult: inputData.executionResult,
+      latestExecutionResult: workerArtifacts.executionResult,
       latestVerification: effectiveVerification,
       finalResponse,
-      steps: [
-        ...state.steps,
-        { ...baseArtifact, verification: effectiveVerification, terminationSignal },
-      ],
+      steps: [...state.steps, continuedArtifact],
+    });
+    await recordWorkflowTurnArtifact({
+      runId: state.workflowRunId,
+      request: inputData.request,
+      app: inputData.app,
+      artifact: continuedArtifact,
+      workflowStatus,
+      recoveryCount: workflowStatus === 'running' ? 0 : state.recoveryCount,
+      recoveryHint: workflowStatus === 'running' ? undefined : state.recoveryHint,
+      handoff: null,
     });
 
     return {

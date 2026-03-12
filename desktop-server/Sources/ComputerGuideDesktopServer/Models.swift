@@ -40,6 +40,35 @@ struct BoundsPayload: Codable, Sendable {
         self.width = rect.size.width
         self.height = rect.size.height
     }
+
+    var rect: CGRect {
+        CGRect(x: self.x, y: self.y, width: self.width, height: self.height)
+    }
+}
+
+struct SizePayload: Codable, Sendable {
+    let width: Double
+    let height: Double
+
+    init(size: CGSize) {
+        self.width = size.width
+        self.height = size.height
+    }
+
+    var size: CGSize {
+        CGSize(width: self.width, height: self.height)
+    }
+}
+
+struct ObservationCapturePayload: Codable, Sendable {
+    let screenshot_path: String
+    let capture_mode: String?
+    let display_id: UInt32?
+    let display_index: Int?
+    let capture_bounds: BoundsPayload
+    let image_size: SizePayload
+    let application: String?
+    let window: String?
 }
 
 struct ResolvedTargetPayload: Codable, Sendable {
@@ -103,6 +132,7 @@ struct HealthPayload: Codable, Sendable {
 struct ClickRequest: Codable, Sendable {
     let element_description: String
     let app: String?
+    let observation_capture: ObservationCapturePayload?
     let num_clicks: Int?
     let button_type: String?
     let hold_keys: [String]?
@@ -116,11 +146,13 @@ struct OpenRequest: Codable, Sendable {
     let app_or_filename: String?
     let url: String?
     let application: String?
+    let ensure_window: Bool?
 }
 
 struct TypeRequest: Codable, Sendable {
     let element_description: String
     let app: String?
+    let observation_capture: ObservationCapturePayload?
     let text: String
     let overwrite: Bool
     let enter: Bool
@@ -128,12 +160,14 @@ struct TypeRequest: Codable, Sendable {
     init(
         element_description: String,
         app: String? = nil,
+        observation_capture: ObservationCapturePayload? = nil,
         text: String = "",
         overwrite: Bool = false,
         enter: Bool = false)
     {
         self.element_description = element_description
         self.app = app
+        self.observation_capture = observation_capture
         self.text = text
         self.overwrite = overwrite
         self.enter = enter
@@ -143,6 +177,7 @@ struct TypeRequest: Codable, Sendable {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.element_description = try container.decode(String.self, forKey: .element_description)
         self.app = try container.decodeIfPresent(String.self, forKey: .app)
+        self.observation_capture = try container.decodeIfPresent(ObservationCapturePayload.self, forKey: .observation_capture)
         self.text = try container.decodeIfPresent(String.self, forKey: .text) ?? ""
         self.overwrite = try container.decodeIfPresent(Bool.self, forKey: .overwrite) ?? false
         self.enter = try container.decodeIfPresent(Bool.self, forKey: .enter) ?? false
@@ -153,12 +188,14 @@ struct DragRequest: Codable, Sendable {
     let starting_description: String
     let ending_description: String
     let app: String?
+    let observation_capture: ObservationCapturePayload?
     let hold_keys: [String]?
 }
 
 struct ScrollRequestPayload: Codable, Sendable {
     let element_description: String
     let app: String?
+    let observation_capture: ObservationCapturePayload?
     let clicks: Int
     let shift: Bool?
 }
@@ -180,6 +217,7 @@ struct SeeRequestPayload: Codable, Sendable {
     let app: String?
     let window_title: String?
     let mode: String?
+    let display_index: Int?
     let path: String?
     let annotate: Bool?
 }
@@ -213,6 +251,7 @@ struct SeeResponse: Codable, Sendable {
     let interactable_count: Int
     let capture_mode: String
     let execution_time: Double
+    let observation_capture: ObservationCapturePayload?
     let ui_elements: [SeeElementPayload]
 }
 

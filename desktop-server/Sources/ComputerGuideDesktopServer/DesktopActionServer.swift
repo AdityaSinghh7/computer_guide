@@ -336,6 +336,7 @@ final class DesktopActionServer {
         let artifact = try await self.groundedActionPipeline().executeSingle(
             description: request.element_description,
             app: request.app,
+            observationCapture: request.observation_capture,
             observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { grounded in
                 try self.customInput.performPointerClick(
                     at: grounded.screenPoint,
@@ -373,6 +374,7 @@ final class DesktopActionServer {
         let target = request.app_or_filename?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let urlString = request.url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let application = request.application?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let ensureWindow = request.ensure_window ?? false
 
         guard !target.isEmpty || !urlString.isEmpty else {
             throw DesktopServerError.invalidInput("open requires app_or_filename or url")
@@ -412,7 +414,22 @@ final class DesktopActionServer {
         }
 
         let app = try await self.applicationService.launchApplication(identifier: target)
-        return self.success(actionID: actionID, message: "Launched \(app.name)", target: nil, startedAt: startedAt)
+        if ensureWindow {
+            try self.requireAccessibility()
+            try await self.applicationService.activateApplication(identifier: app.bundleIdentifier ?? app.name)
+
+            // Many desktop apps surface a primary window with Cmd+N after launch/activation.
+            try await Task.sleep(nanoseconds: 500_000_000)
+            do {
+                try await self.automationService.hotkey(keys: "cmd,n", holdDuration: 0)
+                try await Task.sleep(nanoseconds: 500_000_000)
+            } catch {
+                // Some apps do not support creating a new window this way. The caller will decide how to recover.
+            }
+        }
+
+        let message = ensureWindow ? "Launched \(app.name) and attempted to surface a window" : "Launched \(app.name)"
+        return self.success(actionID: actionID, message: message, target: nil, startedAt: startedAt)
     }
 
     private func handleType(
@@ -427,6 +444,7 @@ final class DesktopActionServer {
         let artifact = try await self.groundedActionPipeline().executeSingle(
             description: request.element_description,
             app: request.app,
+            observationCapture: request.observation_capture,
             observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { grounded in
                 try self.customInput.performPointerClick(at: grounded.screenPoint, button: .left, clickCount: 1, modifiers: [])
                 try await Task.sleep(nanoseconds: 100_000_000)
@@ -469,6 +487,7 @@ final class DesktopActionServer {
             firstDescription: request.starting_description,
             secondDescription: request.ending_description,
             app: request.app,
+            observationCapture: request.observation_capture,
             observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { start, end in
                 try await self.automationService.drag(
                     from: start.screenPoint,
@@ -502,6 +521,7 @@ final class DesktopActionServer {
         let artifact = try await self.groundedActionPipeline().executeSingle(
             description: request.element_description,
             app: request.app,
+            observationCapture: request.observation_capture,
             observabilityContext: self.groundingObservabilityContext(for: httpRequest, actionID: actionID)) { grounded in
                 try await self.automationService.moveMouse(
                     to: grounded.screenPoint,
@@ -565,8 +585,15 @@ final class DesktopActionServer {
     }
 
     private func handleSee(_ request: SeeRequestPayload, actionID: String, startedAt: Date) async throws -> SeeResponse {
-        try await self.activateRequestedApplication(request.app)
+        if Self.shouldActivateRequestedApplication(for: request) {
+            try await self.activateRequestedApplication(request.app)
+        }
         return try await self.visionService.capture(request: request, actionID: actionID, startedAt: startedAt)
+    }
+
+    nonisolated static func shouldActivateRequestedApplication(for request: SeeRequestPayload) -> Bool {
+        let mode = request.mode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return mode != "screen"
     }
 
     private func activateRequestedApplication(_ app: String?) async throws {

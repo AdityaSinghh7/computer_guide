@@ -1,7 +1,11 @@
 import { z } from 'zod';
 
 import { readEnv, readEnvOrDefault } from '../env';
-import { getObservabilityRunId, recordDesktopToolEvent } from './desktopObservability';
+import {
+  getDesktopToolEventOrigin,
+  getObservabilityRunId,
+  recordDesktopToolEvent,
+} from './desktopObservability';
 
 const desktopServerErrorSchema = z.object({
   error: z.object({
@@ -159,9 +163,48 @@ export const desktopSeeSuccessSchema = z.object({
   ui_elements: z.array(desktopUiElementSchema),
 });
 
+export const observationCaptureSpaceSchema = z.object({
+  screenshot_path: z.string(),
+  capture_mode: z.string(),
+  display_id: z.number().int().nonnegative().optional(),
+  display_index: z.number().int().nonnegative().optional(),
+  capture_bounds: z.object({
+    x: z.number(),
+    y: z.number(),
+    width: z.number(),
+    height: z.number(),
+  }),
+  image_size: z.object({
+    width: z.number().int().positive(),
+    height: z.number().int().positive(),
+  }),
+});
+
+export const desktopWorkflowObservationSchema = z.object({
+  action_id: z.string(),
+  ok: z.literal(true),
+  message: z.string(),
+  duration_ms: z.number().nonnegative(),
+  screenshot_raw: z.string(),
+  application_name: z.string().nullable().optional(),
+  window_title: z.string().nullable().optional(),
+  capture_mode: z.string(),
+  observation_capture: observationCaptureSpaceSchema.nullable().optional(),
+});
+
+export const desktopWorkflowObservationRequestSchema = z.object({
+  app: z.string().trim().min(1).optional(),
+  mode: z.literal('screen'),
+  annotate: z.boolean().optional(),
+});
+
 export type DesktopActionSuccess = z.infer<typeof desktopActionSuccessSchema>;
 export type DesktopPermissions = z.infer<typeof desktopPermissionsSchema>;
 export type DesktopPermissionRequest = z.infer<typeof desktopPermissionRequestSchema>;
+export type ObservationCaptureSpace = z.infer<typeof observationCaptureSpaceSchema>;
+export type DesktopWorkflowObservationRequest = z.infer<
+  typeof desktopWorkflowObservationRequestSchema
+>;
 
 export class DesktopActionClientError extends Error {
   code: string;
@@ -285,13 +328,14 @@ const callDesktopJson = async <TOutput>(
       );
     }
 
-    await recordDesktopToolEvent({
-      timestamp: new Date().toISOString(),
-      component: 'mastra-desktop-tool',
-      run_id: runId,
-      tool_id: toolId,
-      path,
-      server_url: baseUrl,
+      await recordDesktopToolEvent({
+        timestamp: new Date().toISOString(),
+        component: 'mastra-desktop-tool',
+        run_id: runId,
+        origin: getDesktopToolEventOrigin(),
+        tool_id: toolId,
+        path,
+        server_url: baseUrl,
       payload,
       outcome: 'success',
       duration_ms: Date.now() - startedAt,
@@ -319,13 +363,14 @@ const callDesktopJson = async <TOutput>(
             },
           );
 
-    await recordDesktopToolEvent({
-      timestamp: new Date().toISOString(),
-      component: 'mastra-desktop-tool',
-      run_id: runId,
-      tool_id: toolId,
-      path,
-      server_url: baseUrl,
+      await recordDesktopToolEvent({
+        timestamp: new Date().toISOString(),
+        component: 'mastra-desktop-tool',
+        run_id: runId,
+        origin: getDesktopToolEventOrigin(),
+        tool_id: toolId,
+        path,
+        server_url: baseUrl,
       payload,
       outcome: 'error',
       duration_ms: Date.now() - startedAt,
@@ -350,6 +395,80 @@ export const callDesktopAction = async <TOutput>(
     toolId?: string;
   },
 ): Promise<TOutput> => callDesktopJson('POST', path, payload, responseSchema, options);
+
+export const captureDesktopObservation = async (
+  payload: DesktopWorkflowObservationRequest,
+) =>
+  callDesktopAction('/v1/see', payload, desktopWorkflowObservationSchema, {
+    toolId: 'workflow_observation',
+  });
+
+const workflowObservationCaptureSpaceSchema = z.object({
+  displayId: z.number().int().nonnegative().optional(),
+  displayIndex: z.number().int().nonnegative().optional(),
+  bounds: z.object({
+    x: z.number(),
+    y: z.number(),
+    width: z.number(),
+    height: z.number(),
+  }),
+  imageWidth: z.number().int().positive(),
+  imageHeight: z.number().int().positive(),
+});
+
+const observationCaptureContextSchema = z.object({
+  computerUseObservation: z
+    .object({
+      screenshotRawPath: z.string(),
+      captureMode: z.string(),
+      captureSpace: workflowObservationCaptureSpaceSchema.optional(),
+    })
+    .optional(),
+});
+
+export const withObservationCaptureHint = (
+  payload: unknown,
+  requestContext: unknown,
+) => {
+  const contextValue =
+    requestContext &&
+    typeof requestContext === 'object' &&
+    'get' in requestContext &&
+    typeof requestContext.get === 'function'
+      ? requestContext.get('computerUseObservation')
+      : requestContext &&
+          typeof requestContext === 'object' &&
+          'computerUseObservation' in requestContext
+        ? requestContext.computerUseObservation
+        : undefined;
+  const parsedContext = observationCaptureContextSchema.safeParse({
+    computerUseObservation: contextValue,
+  });
+  if (
+    !parsedContext.success ||
+    !parsedContext.data.computerUseObservation?.captureSpace ||
+    typeof payload !== 'object' ||
+    payload === null ||
+    Array.isArray(payload)
+  ) {
+    return payload;
+  }
+
+  return {
+    ...payload,
+    observation_capture: {
+      screenshot_path: parsedContext.data.computerUseObservation.screenshotRawPath,
+      capture_mode: parsedContext.data.computerUseObservation.captureMode,
+      display_id: parsedContext.data.computerUseObservation.captureSpace.displayId,
+      display_index: parsedContext.data.computerUseObservation.captureSpace.displayIndex,
+      capture_bounds: parsedContext.data.computerUseObservation.captureSpace.bounds,
+      image_size: {
+        width: parsedContext.data.computerUseObservation.captureSpace.imageWidth,
+        height: parsedContext.data.computerUseObservation.captureSpace.imageHeight,
+      },
+    } satisfies ObservationCaptureSpace,
+  };
+};
 
 export const getDesktopServerHealth = async () =>
   callDesktopJson('GET', '/v1/health', null, desktopHealthSchema, { toolId: 'desktop_health' });

@@ -2,9 +2,14 @@ import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 
 import {
+  recordWorkerToolCall,
+  recordWorkerToolResult,
+} from '../computer-use/worker-turn-tracker';
+import {
   callDesktopAction,
   desktopActionSuccessSchema,
   desktopSeeSuccessSchema,
+  withObservationCaptureHint,
 } from './desktopActionClient';
 
 const createGuiActionResultSchema = () =>
@@ -15,6 +20,45 @@ const createGuiActionResultSchema = () =>
   });
 
 const guiActionResultSchema = createGuiActionResultSchema();
+
+const executeTrackedDesktopAction = async <TResult>(
+  toolId: string,
+  args: unknown,
+  requestContext: unknown,
+  run: () => Promise<TResult>,
+) => {
+  const trackedCall = recordWorkerToolCall(
+    requestContext as Record<string, unknown> | undefined,
+    toolId,
+    args,
+  );
+
+  try {
+    const result = await run();
+    recordWorkerToolResult(
+      requestContext as Record<string, unknown> | undefined,
+      trackedCall,
+      toolId,
+      args,
+      result,
+    );
+    return result;
+  } catch (error) {
+    recordWorkerToolResult(
+      requestContext as Record<string, unknown> | undefined,
+      trackedCall,
+      toolId,
+      args,
+      {
+        error: {
+          name: error instanceof Error ? error.name : 'Error',
+          message: error instanceof Error ? error.message : String(error),
+        },
+      },
+    );
+    throw error;
+  }
+};
 
 export const clickArgsSchema = z.object({
   element_description: z
@@ -52,7 +96,15 @@ export const clickTool = createTool({
     'Click a specific UI element on screen using vision-based grounding. Use this for buttons, links, controls, tabs, menus, or other clickable targets. Provide the app when known and make the element description visually specific.',
   inputSchema: clickArgsSchema,
   outputSchema: clickResultSchema,
-  execute: input => callDesktopAction('/v1/click', input, clickResultSchema, { toolId: 'click' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('click', input, context?.requestContext, () =>
+      callDesktopAction(
+        '/v1/click',
+        withObservationCaptureHint(input, context?.requestContext),
+        clickResultSchema,
+        { toolId: 'click' },
+      ),
+    ),
 });
 
 export const switchApplicationsArgsSchema = z.object({
@@ -72,10 +124,12 @@ export const switchApplicationsTool = createTool({
     'Bring an already-open desktop application to the foreground. Use this proactively whenever the user asks about or wants to interact with a specific app that may not already be frontmost.',
   inputSchema: switchApplicationsArgsSchema,
   outputSchema: switchApplicationsResultSchema,
-  execute: input =>
-    callDesktopAction('/v1/switch-application', input, switchApplicationsResultSchema, {
-      toolId: 'switch_applications',
-    }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('switch_applications', input, context?.requestContext, () =>
+      callDesktopAction('/v1/switch-application', input, switchApplicationsResultSchema, {
+        toolId: 'switch_applications',
+      }),
+    ),
 });
 
 export const openArgsSchema = z
@@ -104,6 +158,12 @@ export const openArgsSchema = z
       .describe(
         'Optional application name, bundle identifier, or app path to use when opening the URL or file. Use this to force a URL to open in a specific browser such as com.google.Chrome.',
       ),
+    ensure_window: z
+      .boolean()
+      .default(false)
+      .describe(
+        'When opening an application by name, also try to surface a usable window if the app launches or activates without one. Use this for recovery when the workflow knows the target app has no open windows.',
+      ),
   })
   .refine(input => Boolean(input.app_or_filename || input.url), {
     message: 'Provide either app_or_filename or url.',
@@ -115,10 +175,13 @@ export const openResultSchema = guiActionResultSchema;
 export const openTool = createTool({
   id: 'open',
   description:
-    'Open an application, file, folder, document, or URL using the operating system launcher. Prefer this over typing into a browser address bar when the goal is to open a known URL, and provide application when the URL must open in a specific app like Chrome.',
+    'Open an application, file, folder, document, or URL using the operating system launcher. Prefer this over typing into a browser address bar when the goal is to open a known URL, and provide application when the URL must open in a specific app like Chrome. When recovering from a missing app window, set ensure_window so the OS launcher also tries to surface a usable window.',
   inputSchema: openArgsSchema,
   outputSchema: openResultSchema,
-  execute: input => callDesktopAction('/v1/open', input, openResultSchema, { toolId: 'open' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('open', input, context?.requestContext, () =>
+      callDesktopAction('/v1/open', input, openResultSchema, { toolId: 'open' }),
+    ),
 });
 
 export const typeArgsSchema = z.object({
@@ -155,7 +218,15 @@ export const typeTool = createTool({
     'Type or paste text into a visually described field using vision-based grounding. Use this for forms, search boxes, editors, chat inputs, and other text entry tasks.',
   inputSchema: typeArgsSchema,
   outputSchema: typeResultSchema,
-  execute: input => callDesktopAction('/v1/type', input, typeResultSchema, { toolId: 'type' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('type', input, context?.requestContext, () =>
+      callDesktopAction(
+        '/v1/type',
+        withObservationCaptureHint(input, context?.requestContext),
+        typeResultSchema,
+        { toolId: 'type' },
+      ),
+    ),
 });
 
 export const dragAndDropArgsSchema = z.object({
@@ -191,8 +262,15 @@ export const dragAndDropTool = createTool({
     'Drag from one visually described UI location to another and then release using vision-based grounding. Use this for moving files, reordering items, resizing panes, or any interaction that requires a click-drag gesture.',
   inputSchema: dragAndDropArgsSchema,
   outputSchema: dragAndDropResultSchema,
-  execute: input =>
-    callDesktopAction('/v1/drag', input, dragAndDropResultSchema, { toolId: 'drag_and_drop' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('drag_and_drop', input, context?.requestContext, () =>
+      callDesktopAction(
+        '/v1/drag',
+        withObservationCaptureHint(input, context?.requestContext),
+        dragAndDropResultSchema,
+        { toolId: 'drag_and_drop' },
+      ),
+    ),
 });
 
 export const scrollArgsSchema = z.object({
@@ -228,7 +306,15 @@ export const scrollTool = createTool({
     'Scroll within a visually described UI region or element using vision-based grounding. Use this to reveal off-screen content, move through lists or documents, or perform horizontal scrolling when supported.',
   inputSchema: scrollArgsSchema,
   outputSchema: scrollResultSchema,
-  execute: input => callDesktopAction('/v1/scroll', input, scrollResultSchema, { toolId: 'scroll' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('scroll', input, context?.requestContext, () =>
+      callDesktopAction(
+        '/v1/scroll',
+        withObservationCaptureHint(input, context?.requestContext),
+        scrollResultSchema,
+        { toolId: 'scroll' },
+      ),
+    ),
 });
 
 export const hotkeyArgsSchema = z.object({
@@ -248,7 +334,10 @@ export const hotkeyTool = createTool({
     'Press a keyboard shortcut combination simultaneously. Use this for standard OS or application shortcuts such as copy, paste, save, undo, tab switching, or command palette access.',
   inputSchema: hotkeyArgsSchema,
   outputSchema: hotkeyResultSchema,
-  execute: input => callDesktopAction('/v1/hotkey', input, hotkeyResultSchema, { toolId: 'hotkey' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('hotkey', input, context?.requestContext, () =>
+      callDesktopAction('/v1/hotkey', input, hotkeyResultSchema, { toolId: 'hotkey' }),
+    ),
 });
 
 export const holdAndPressArgsSchema = z.object({
@@ -270,10 +359,12 @@ export const holdAndPressTool = createTool({
     'Hold one or more keys and then press another sequence of keys while they remain held. Use this for multi-step keyboard gestures that are more specific than a single hotkey combination.',
   inputSchema: holdAndPressArgsSchema,
   outputSchema: holdAndPressResultSchema,
-  execute: input =>
-    callDesktopAction('/v1/hold-and-press', input, holdAndPressResultSchema, {
-      toolId: 'hold_and_press',
-    }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('hold_and_press', input, context?.requestContext, () =>
+      callDesktopAction('/v1/hold-and-press', input, holdAndPressResultSchema, {
+        toolId: 'hold_and_press',
+      }),
+    ),
 });
 
 export const waitArgsSchema = z.object({
@@ -293,7 +384,10 @@ export const waitTool = createTool({
     'Pause execution for a specific amount of time. Use this when the interface needs time to update before another GUI action should happen.',
   inputSchema: waitArgsSchema,
   outputSchema: waitResultSchema,
-  execute: input => callDesktopAction('/v1/wait', input, waitResultSchema, { toolId: 'wait' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('wait', input, context?.requestContext, () =>
+      callDesktopAction('/v1/wait', input, waitResultSchema, { toolId: 'wait' }),
+    ),
 });
 
 export const seeArgsSchema = z.object({
@@ -339,7 +433,10 @@ export const seeTool = createTool({
     'Capture the current macOS UI state and return a screenshot plus detected UI elements. Use this to inspect what is on screen or debug why a vision-grounded action failed. When the user asks about a specific app, prefer targeting that app or switching to it first instead of describing whatever app is currently frontmost.',
   inputSchema: seeArgsSchema,
   outputSchema: seeResultSchema,
-  execute: input => callDesktopAction('/v1/see', input, seeResultSchema, { toolId: 'see' }),
+  execute: (input, context) =>
+    executeTrackedDesktopAction('see', input, context?.requestContext, () =>
+      callDesktopAction('/v1/see', input, seeResultSchema, { toolId: 'see' }),
+    ),
 });
 
 export const screenshotArgsSchema = z.object({
@@ -379,14 +476,16 @@ export const screenshotTool = createTool({
     'Capture a screenshot of the current desktop or a targeted app/window. Use this when you need a saved image of the UI, or when you want a screenshot plus the same element metadata returned by see. When the user asks about a specific app, prefer targeting that app or switching to it first before capturing.',
   inputSchema: screenshotArgsSchema,
   outputSchema: screenshotResultSchema,
-  execute: input =>
-    callDesktopAction(
-      '/v1/see',
-      {
-        ...input,
-      },
-      screenshotResultSchema,
-      { toolId: 'screenshot' },
+  execute: (input, context) =>
+    executeTrackedDesktopAction('screenshot', input, context?.requestContext, () =>
+      callDesktopAction(
+        '/v1/see',
+        {
+          ...input,
+        },
+        screenshotResultSchema,
+        { toolId: 'screenshot' },
+      ),
     ),
 });
 

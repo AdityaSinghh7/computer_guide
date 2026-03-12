@@ -43,7 +43,7 @@ const availableActionHints = [
   'hotkey: send a keyboard shortcut',
   'hold_and_press: hold modifier keys while pressing others',
   'wait: pause briefly when the UI is already changing',
-  'see: capture a fresh screenshot only when you need to re-check the UI during this same turn',
+  'Use the provided workflow-owned observation as the source of truth for this turn; you cannot refresh it during the same turn.',
 ].join('\n');
 
 const actionArgHints = [
@@ -54,6 +54,15 @@ const actionArgHints = [
   'scroll args: { "element_description": "visible region", "app"?: "Google Chrome", "clicks": -3, "shift"?: false }',
   'Never use snapshot_id, element_id, id, or element in GUI tool arguments.',
 ].join('\n');
+
+const formatObservationContext = (observation: ComputerUseObservation) =>
+  [
+    observation.applicationName ? `Visible app: ${observation.applicationName}` : null,
+    observation.windowTitle ? `Visible window: ${observation.windowTitle}` : null,
+    `Capture mode: ${observation.captureMode}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
 
 export const buildWorkerMessages = async ({
   task,
@@ -90,14 +99,14 @@ export const buildWorkerMessages = async ({
           `Task: ${task}`,
           `Preferred app: ${app ?? observation.applicationName ?? 'unknown'}`,
           `Current step: ${stepIndex}`,
-          `Available GUI tools: ${computerUseActionToolIds.join(', ')}, see, screenshot`,
-          `Turn contract: use the desktop tools directly when action is needed. Before you finish the turn, call computer_use_control exactly once with status, summary, todoItems, scratchpad, and an optional handoff. After that tool call, return one short plain-language update for the user.`,
+          `Available GUI tools: ${computerUseActionToolIds.join(', ')}`,
+          `Turn contract: use the desktop tools directly when action is needed. The provided workflow-owned observation remains authoritative for the entire turn, and you cannot refresh it mid-turn. Before you finish the turn, call computer_use_control exactly once with status, summary, todoItems, scratchpad, and an optional handoff. After that tool call, return one short plain-language update for the user.`,
           `Tool guidance:\n${availableActionHints}`,
           `Argument guidance:\n${actionArgHints}`,
           `Task todo:\n${formatTodo(taskTodo)}`,
           `Scratchpad:\n${scratchpad.length > 0 ? scratchpad.map(item => `- ${item}`).join('\n') : 'none'}`,
           `Recovery context: ${recoveryHint ? `${recoveryHint} (attempt ${recoveryCount})` : 'none'}`,
-          observation.summaryText,
+          formatObservationContext(observation),
           artifacts.length > 0 ? `Recent history:\n${formatRecentArtifacts(artifacts)}` : 'Recent history: none yet.',
         ].join('\n\n'),
       },
@@ -138,8 +147,8 @@ export const buildVerifierMessages = async ({
           `Executed tool: ${artifact.workerTurn.executedAction?.toolName ?? 'none'}`,
           `Task todo:\n${formatTodo(taskTodo)}`,
           `Scratchpad:\n${scratchpad.length > 0 ? scratchpad.map(item => `- ${item}`).join('\n') : 'none'}`,
-          `Before observation:\n${artifact.beforeObservation.summaryText}`,
-          `After observation:\n${artifact.afterObservation.summaryText}`,
+          `Before observation:\n${formatObservationContext(artifact.beforeObservation)}`,
+          `After observation:\n${formatObservationContext(artifact.afterObservation)}`,
           `Execution message: ${artifact.executionResult?.message ?? 'none'}`,
         ].join('\n\n'),
       },
